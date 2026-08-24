@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>Turtle Cup — Live Match Play</title>
+<title>Turtle Cup — Ryder Cup Format</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -25,6 +25,7 @@
   .sticky-col{ position:sticky; left:0; background:#101a14; z-index:1; }
   th.sticky-col{ background:#16221a; z-index:2; }
   .score-input:focus{ background:#16241b; }
+  select{ color-scheme: dark; }
   .fade-in{ animation: fadein .18s ease-out; }
   @keyframes fadein{ from{opacity:0; transform:translateY(2px);} to{opacity:1; transform:translateY(0);} }
 </style>
@@ -34,9 +35,10 @@
 
 <script>
 /* =========================================================
-   TURTLE CUP — DATA MODEL
+   TURTLE CUP — RYDER CUP FORMAT — DATA MODEL
    ========================================================= */
-const COLORS = ['#2dd4bf','#f2b134','#60a5fa','#fb7185','#a78bfa','#a3e635','#fb923c','#f472b6'];
+const RED = '#fb6a6a';
+const BLUE = '#5aa9f2';
 
 // Terrapin Ridge Golf Club — Par 72, Stroke Index 1-18
 const PARS = [4,5,3,4,4,3,5,4,4, 4,4,3,5,4,4,3,5,4];
@@ -46,55 +48,114 @@ const MATCH_META = {
   m1: { id:'m1', label:'Match 1', sub:'Friday · 18 Holes · Better Ball', format:'betterball' },
   m2: { id:'m2', label:'Match 2', sub:'Saturday AM · 18 Holes · Better Ball', format:'betterball' },
   m3: { id:'m3', label:'Match 3', sub:'Saturday PM · 9 Holes · Pinehurst', format:'pinehurst' },
-  m4: { id:'m4', label:'Match 4', sub:'Sunday · Singles Best Ball', format:'singles' },
+  m4: { id:'m4', label:'Match 4', sub:'Sunday · Singles Match Play', format:'singles' },
 };
 
-const BASELINE_TEAMS = [
-  { id:'t1', name:'Shell Shockers', players:[ {id:'p1', name:'Alex Morgan', hcp:9}, {id:'p2', name:'Jamie Lee', hcp:13} ] },
-  { id:'t2', name:'Snapping Turtles', players:[ {id:'p3', name:'Chris Park', hcp:6}, {id:'p4', name:'Sam Rivera', hcp:16} ] },
-  { id:'t3', name:'Sea Turtles', players:[ {id:'p5', name:'Jordan Blake', hcp:11}, {id:'p6', name:'Taylor Kim', hcp:18} ] },
-  { id:'t4', name:'Box Turtles', players:[ {id:'p7', name:'Casey Nguyen', hcp:8}, {id:'p8', name:'Morgan Diaz', hcp:21} ] },
-];
-function defaultTeams(){ return JSON.parse(JSON.stringify(BASELINE_TEAMS)); }
-
-const LS_KEY = 'turtleCupState_v1';
+const LS_KEY = 'turtleCupRyderState_v1';
 const ADMIN_PASSCODE = '1234';
 let lastSavedAt = null;
+let nextPlayerNum = 1;
+let nextPairNum = 1;
 
-let STATE = {
-  ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, single:{} },
-  admin: { enabled:false },
-  teams: defaultTeams(),
-  pairs: [],
-  scores: {},
-};
+function baselineRoster(){
+  return {
+    red: [
+      { id:'p1', name:'Alex Morgan', hcp:9 },
+      { id:'p2', name:'Jamie Lee', hcp:13 },
+      { id:'p3', name:'Chris Park', hcp:6 },
+      { id:'p4', name:'Sam Rivera', hcp:16 },
+    ],
+    blue: [
+      { id:'p5', name:'Jordan Blake', hcp:11 },
+      { id:'p6', name:'Taylor Kim', hcp:18 },
+      { id:'p7', name:'Casey Nguyen', hcp:8 },
+      { id:'p8', name:'Morgan Diaz', hcp:21 },
+    ],
+  };
+}
 
-let nextTeamNum = 5;
-let nextPlayerNum = 9;
+// Captains set independent pairings per match — default mock data shows different combos each round
+function baselineLineups(){
+  return {
+    m1: [
+      { id:'pair1', red:['p1','p2'], blue:['p5','p6'] },
+      { id:'pair2', red:['p3','p4'], blue:['p7','p8'] },
+    ],
+    m2: [
+      { id:'pair3', red:['p1','p3'], blue:['p5','p7'] },
+      { id:'pair4', red:['p2','p4'], blue:['p6','p8'] },
+    ],
+    m3: [
+      { id:'pair5', red:['p1','p4'], blue:['p5','p8'] },
+      { id:'pair6', red:['p2','p3'], blue:['p6','p7'] },
+    ],
+    m4: [
+      { id:'pair7', red:'p1', blue:'p5' },
+      { id:'pair8', red:'p2', blue:'p6' },
+      { id:'pair9', red:'p3', blue:'p7' },
+      { id:'pair10', red:'p4', blue:'p8' },
+    ],
+  };
+}
+
+function emptyHoles(matchId){
+  const count = matchId==='m3' ? 9 : 18;
+  if(matchId==='m1' || matchId==='m2'){
+    return Array.from({length:count}, () => ({ a1:'', a2:'', b1:'', b2:'' }));
+  }
+  return Array.from({length:count}, () => ({ a:'', b:'' }));
+}
+
+function buildScoresForLineups(lineups){
+  const scores = {};
+  Object.keys(MATCH_META).forEach(mid => {
+    scores[mid] = {};
+    (lineups[mid] || []).forEach(pair => {
+      scores[mid][pair.id] = { holes: emptyHoles(mid) };
+    });
+  });
+  return scores;
+}
+
+function defaultState(){
+  const lineups = baselineLineups();
+  return {
+    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} } },
+    admin: { enabled:false },
+    teamNames: { red:'Team Red', blue:'Team Blue' },
+    roster: baselineRoster(),
+    lineups,
+    scores: buildScoresForLineups(lineups),
+  };
+}
+
+let STATE = defaultState();
 
 /* =========================================================
    PERSISTENCE (offline cache / localStorage sync)
    ========================================================= */
 function recalcCounters(){
-  let maxT=0, maxP=0;
-  STATE.teams.forEach(t=>{
-    const tn = parseInt(String(t.id).replace(/[^0-9]/g,''),10);
-    if(!isNaN(tn)) maxT = Math.max(maxT, tn);
-    t.players.forEach(p=>{
-      const pn = parseInt(String(p.id).replace(/[^0-9]/g,''),10);
-      if(!isNaN(pn)) maxP = Math.max(maxP, pn);
-    });
+  let maxP=0, maxPair=0;
+  [...STATE.roster.red, ...STATE.roster.blue].forEach(p=>{
+    const n = parseInt(String(p.id).replace(/[^0-9]/g,''),10);
+    if(!isNaN(n)) maxP = Math.max(maxP, n);
   });
-  nextTeamNum = maxT+1;
+  Object.values(STATE.lineups).forEach(list => list.forEach(pair => {
+    const n = parseInt(String(pair.id).replace(/[^0-9]/g,''),10);
+    if(!isNaN(n)) maxPair = Math.max(maxPair, n);
+  }));
   nextPlayerNum = maxP+1;
+  nextPairNum = maxPair+1;
 }
 
 function saveState(){
   try{
-    const payload = { teams: STATE.teams, pairs: STATE.pairs, scores: STATE.scores, ui: STATE.ui, savedAt: Date.now() };
-    localStorage.setItem(LS_KEY, JSON.stringify(payload));
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      teamNames: STATE.teamNames, roster: STATE.roster, lineups: STATE.lineups, scores: STATE.scores,
+      ui: { tab: STATE.ui.tab, pairing: STATE.ui.pairing }, savedAt: Date.now(),
+    }));
     lastSavedAt = Date.now();
-  } catch(e){ /* storage unavailable — fail silently, app still works in-memory */ }
+  } catch(e){ /* storage unavailable — app still works in-memory */ }
 }
 
 function loadState(){
@@ -102,11 +163,12 @@ function loadState(){
     const raw = localStorage.getItem(LS_KEY);
     if(!raw) return false;
     const parsed = JSON.parse(raw);
-    if(!parsed || !Array.isArray(parsed.teams) || !parsed.scores) return false;
-    STATE.teams = parsed.teams;
-    STATE.pairs = parsed.pairs && parsed.pairs.length ? parsed.pairs : pairTeams();
+    if(!parsed || !parsed.roster || !parsed.lineups || !parsed.scores) return false;
+    STATE.teamNames = parsed.teamNames || STATE.teamNames;
+    STATE.roster = parsed.roster;
+    STATE.lineups = parsed.lineups;
     STATE.scores = parsed.scores;
-    STATE.ui = parsed.ui || STATE.ui;
+    if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; }
     lastSavedAt = parsed.savedAt || Date.now();
     return true;
   } catch(e){ return false; }
@@ -120,31 +182,6 @@ function formatClock(ts){
 /* =========================================================
    CORE GOLF LOGIC
    ========================================================= */
-function pairTeams(){
-  const pairs = [];
-  for(let i=0;i<STATE.teams.length;i+=2){
-    pairs.push({ a:i, b:(i+1<STATE.teams.length)? i+1 : null });
-  }
-  return pairs;
-}
-
-function buildScores(){
-  const pairs = pairTeams();
-  STATE.pairs = pairs;
-  const scores = {};
-  scores.m1 = pairs.map(p => p.b===null ? null : { holes: Array.from({length:18},()=>({a1:'',a2:'',b1:'',b2:''})) });
-  scores.m2 = pairs.map(p => p.b===null ? null : { holes: Array.from({length:18},()=>({a1:'',a2:'',b1:'',b2:''})) });
-  scores.m3 = pairs.map(p => p.b===null ? null : { holes: Array.from({length:9},()=>({a:'',b:''})) });
-  scores.m4 = pairs.map(p => p.b===null ? null : [
-    { holes: Array.from({length:18},()=>({a:'',b:''})) },
-    { holes: Array.from({length:18},()=>({a:'',b:''})) },
-  ]);
-  STATE.scores = scores;
-  STATE.ui.pairing = { m1:0, m2:0, m3:0, m4:0 };
-  STATE.ui.single = {};
-}
-
-// Strokes a player/team receives on a given hole based on raw handicap + hole's stroke index (1-18)
 function strokesOnHole(hcp, si){
   if(hcp == null || hcp < 0) return 0;
   const base = Math.floor(hcp/18);
@@ -152,8 +189,13 @@ function strokesOnHole(hcp, si){
   return base + (si <= remainder ? 1 : 0);
 }
 
-function teamHandicap(team){
-  return Math.round((team.players[0].hcp + team.players[1].hcp)/2);
+function playerById(id){
+  return STATE.roster.red.find(p=>p.id===id) || STATE.roster.blue.find(p=>p.id===id) || { id, name:'Unknown', hcp:0 };
+}
+
+function teamHandicapOf(ids){
+  const p1 = playerById(ids[0]), p2 = playerById(ids[1]);
+  return Math.round((p1.hcp + p2.hcp)/2);
 }
 
 function bestOf(x,y){
@@ -174,21 +216,19 @@ function holeRange(matchId){
   return matchId === 'm3' ? { start:9, count:9 } : { start:0, count:18 };
 }
 
-// Runs match-play logic over an ordered array of 'a'|'b'|'halved'|null hole results
+// Runs match-play logic over an ordered array of 'a'|'b'|'halved'|null hole results (used per segment)
 function playMatch(results){
   const total = results.length;
   let diff = 0;
   let clinch = null;
-  const statusPerHole = [];
   let enteredCount = 0;
   let stopped = false;
 
   for(let i=0;i<total;i++){
     const r = results[i];
-    if(stopped || r === null){ statusPerHole.push(null); if(!stopped) stopped = true; continue; }
+    if(stopped || r === null){ if(!stopped) stopped = true; continue; }
     enteredCount++;
     if(r==='a') diff++; else if(r==='b') diff--;
-    statusPerHole.push(diff);
     const holesPlayed = i+1;
     const holesRemaining = total - holesPlayed;
     if(clinch===null && Math.abs(diff) > holesRemaining){
@@ -215,102 +255,142 @@ function playMatch(results){
   } else {
     final = { finished:false };
   }
-  return { statusPerHole, final, currentDiff: diff, enteredCount };
+  return { final, currentDiff: diff, enteredCount };
 }
 
-// Builds full per-hole detail (nets, winners) + final match result for a given scorecard
-function evaluateMatch(matchId, pairingIdx, sub){
-  const pair = STATE.pairs[pairingIdx];
-  const teamA = STATE.teams[pair.a];
-  const teamB = STATE.teams[pair.b];
+// Overall running diff (per hole) purely for the status column of the full scorecard
+function runningDiffs(results){
+  let diff = 0;
+  const out = [];
+  for(let i=0;i<results.length;i++){
+    const r = results[i];
+    if(r===null){ out.push(null); continue; }
+    if(r==='a') diff++; else if(r==='b') diff--;
+    out.push(diff);
+  }
+  return out;
+}
+
+// 3-point segment engine: Front9/Back9/Overall for 18H matches, Holes1-5/6-9/Overall for the 9H Pinehurst match
+function computeSegments(matchId, results){
+  const defs = matchId==='m3'
+    ? [ { label:'Holes 1–5', s:0, e:5 }, { label:'Holes 6–9', s:5, e:9 }, { label:'Overall', s:0, e:9 } ]
+    : [ { label:'Front 9', s:0, e:9 }, { label:'Back 9', s:9, e:18 }, { label:'Overall', s:0, e:18 } ];
+  return defs.map(d => ({ label:d.label, ...playMatch(results.slice(d.s, d.e)) }));
+}
+
+function segmentPointTotals(segments){
+  let a=0, b=0;
+  segments.forEach(s => { if(s.final.finished){ a += s.final.pointsA; b += s.final.pointsB; } });
+  return { a, b };
+}
+
+// Builds full per-hole detail + 3-point segments for one pairing's scorecard
+function evaluateMatch(matchId, pairingId){
+  const pair = (STATE.lineups[matchId] || []).find(p => p.id === pairingId);
+  if(!pair) return null;
   const { start, count } = holeRange(matchId);
-  const results = [];
+  const entry = STATE.scores[matchId][pairingId];
   const holesDetail = [];
+  const results = [];
 
   if(matchId==='m1' || matchId==='m2'){
-    const entry = STATE.scores[matchId][pairingIdx];
+    const rp1 = playerById(pair.red[0]), rp2 = playerById(pair.red[1]);
+    const bp1 = playerById(pair.blue[0]), bp2 = playerById(pair.blue[1]);
     for(let i=0;i<count;i++){
       const si = SIS[start+i];
       const h = entry.holes[i];
-      const a1 = h.a1===''?null:(h.a1 - strokesOnHole(teamA.players[0].hcp, si));
-      const a2 = h.a2===''?null:(h.a2 - strokesOnHole(teamA.players[1].hcp, si));
-      const b1 = h.b1===''?null:(h.b1 - strokesOnHole(teamB.players[0].hcp, si));
-      const b2 = h.b2===''?null:(h.b2 - strokesOnHole(teamB.players[1].hcp, si));
+      const a1 = h.a1===''?null:(h.a1 - strokesOnHole(rp1.hcp, si));
+      const a2 = h.a2===''?null:(h.a2 - strokesOnHole(rp2.hcp, si));
+      const b1 = h.b1===''?null:(h.b1 - strokesOnHole(bp1.hcp, si));
+      const b2 = h.b2===''?null:(h.b2 - strokesOnHole(bp2.hcp, si));
       const aNet = bestOf(a1,a2), bNet = bestOf(b1,b2);
       const w = holeWinner(aNet,bNet);
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:PARS[start+i], si, raw:h, a1,a2,b1,b2, aNet, bNet, winner:w });
     }
+    var redPlayers=[rp1,rp2], bluePlayers=[bp1,bp2];
   } else if(matchId==='m3'){
-    const entry = STATE.scores.m3[pairingIdx];
-    const hcpA = teamHandicap(teamA), hcpB = teamHandicap(teamB);
+    const hcpRed = teamHandicapOf(pair.red), hcpBlue = teamHandicapOf(pair.blue);
     for(let i=0;i<count;i++){
       const si = SIS[start+i];
       const h = entry.holes[i];
-      const aNet = h.a===''?null:(h.a - strokesOnHole(hcpA, si));
-      const bNet = h.b===''?null:(h.b - strokesOnHole(hcpB, si));
+      const aNet = h.a===''?null:(h.a - strokesOnHole(hcpRed, si));
+      const bNet = h.b===''?null:(h.b - strokesOnHole(hcpBlue, si));
       const w = holeWinner(aNet,bNet);
       results.push(w);
-      holesDetail.push({ hole:start+i+1, par:PARS[start+i], si, raw:h, hcpA, hcpB, aNet, bNet, winner:w });
+      holesDetail.push({ hole:start+i+1, par:PARS[start+i], si, raw:h, hcpRed, hcpBlue, aNet, bNet, winner:w });
     }
+    var redPlayers=[playerById(pair.red[0]), playerById(pair.red[1])];
+    var bluePlayers=[playerById(pair.blue[0]), playerById(pair.blue[1])];
   } else if(matchId==='m4'){
-    const entry = STATE.scores.m4[pairingIdx][sub];
-    const pA = teamA.players[sub], pB = teamB.players[sub];
+    const rp = playerById(pair.red), bp = playerById(pair.blue);
     for(let i=0;i<count;i++){
       const si = SIS[start+i];
       const h = entry.holes[i];
-      const aNet = h.a===''?null:(h.a - strokesOnHole(pA.hcp, si));
-      const bNet = h.b===''?null:(h.b - strokesOnHole(pB.hcp, si));
+      const aNet = h.a===''?null:(h.a - strokesOnHole(rp.hcp, si));
+      const bNet = h.b===''?null:(h.b - strokesOnHole(bp.hcp, si));
       const w = holeWinner(aNet,bNet);
       results.push(w);
-      holesDetail.push({ hole:start+i+1, par:PARS[start+i], si, raw:h, pA, pB, aNet, bNet, winner:w });
+      holesDetail.push({ hole:start+i+1, par:PARS[start+i], si, raw:h, rp, bp, aNet, bNet, winner:w });
     }
+    var redPlayers=[rp], bluePlayers=[bp];
   }
 
-  const played = playMatch(results);
-  return { teamA, teamB, holesDetail, ...played };
+  const segments = computeSegments(matchId, results);
+  const totals = segmentPointTotals(segments);
+  const statusPerHole = runningDiffs(results);
+
+  return { pair, redPlayers, bluePlayers, holesDetail, segments, totals, statusPerHole };
+}
+
+function allPairingIds(matchId){
+  return (STATE.lineups[matchId] || []).map(p => p.id);
 }
 
 function computeStandings(){
-  const pts = {};
-  STATE.teams.forEach(t => pts[t.id] = 0);
-  STATE.pairs.forEach((pair, idx) => {
-    if(pair.b===null) return;
-    const teamA = STATE.teams[pair.a], teamB = STATE.teams[pair.b];
-    ['m1','m2','m3'].forEach(mid => {
-      const r = evaluateMatch(mid, idx);
-      if(r.final.finished){ pts[teamA.id]+=r.final.pointsA; pts[teamB.id]+=r.final.pointsB; }
-    });
-    [0,1].forEach(sub => {
-      const r = evaluateMatch('m4', idx, sub);
-      if(r.final.finished){ pts[teamA.id]+=r.final.pointsA; pts[teamB.id]+=r.final.pointsB; }
+  let red=0, blue=0, totalAvailable=0;
+  Object.keys(MATCH_META).forEach(mid => {
+    allPairingIds(mid).forEach(pid => {
+      totalAvailable += 3;
+      const evalr = evaluateMatch(mid, pid);
+      if(evalr){ red += evalr.totals.a; blue += evalr.totals.b; }
     });
   });
-  return pts;
+  return { red, blue, totalAvailable, target: totalAvailable/2 };
 }
 
 /* =========================================================
-   RENDERING
+   RENDERING — SHARED HELPERS
    ========================================================= */
-function teamColor(teamIdx){ return COLORS[teamIdx % COLORS.length]; }
-function teamIdxById(id){ return STATE.teams.findIndex(t=>t.id===id); }
+function initials(name){ return name.split(' ').map(w=>w[0]).join('').toUpperCase(); }
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeAttr(s){ return escapeHtml(s); }
 
+function pairingLabel(matchId, pair){
+  if(matchId==='m4'){
+    return `${initials(playerById(pair.red).name)} vs ${initials(playerById(pair.blue).name)}`;
+  }
+  const r = pair.red.map(id=>initials(playerById(id).name)).join('/');
+  const b = pair.blue.map(id=>initials(playerById(id).name)).join('/');
+  return `${r} vs ${b}`;
+}
+
+/* =========================================================
+   RENDERING — HEADER
+   ========================================================= */
 function renderHeader(){
-  const pts = computeStandings();
-  const ranked = STATE.teams.map((t,i)=>({...t, idx:i, pts:pts[t.id]})).sort((a,b)=>b.pts-a.pts);
-  const cards = ranked.map(t => `
-    <div class="flex-shrink-0 flex items-center gap-2 bg-[#0f1913]/80 border border-[#233327] rounded-xl px-3 py-2 min-w-[112px]">
-      <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${teamColor(t.idx)}"></span>
-      <div class="leading-tight">
-        <div class="text-[11px] text-[#9db3a4] truncate max-w-[80px]">${escapeHtml(t.name)}</div>
-        <div class="font-display font-700 text-lg text-[#eef3ee]">${t.pts.toFixed(1)}</div>
-      </div>
-    </div>`).join('');
-
+  const st = computeStandings();
   const online = navigator.onLine;
   const syncLabel = online ? 'Online · Synced' : 'Offline · Cache Saved';
   const syncDot = online ? 'bg-emerald-400' : 'bg-amber-400';
   const syncText = online ? 'text-emerald-300' : 'text-amber-300';
+
+  const totalForBar = Math.max(st.totalAvailable, 1);
+  const redPct = (st.red/totalForBar)*100;
+  const bluePct = (st.blue/totalForBar)*100;
 
   return `
   <div class="shell-pattern border-b border-[#1c2a20] bg-gradient-to-b from-[#0f1a13] to-[#0a100c]">
@@ -320,7 +400,7 @@ function renderHeader(){
           <span class="text-2xl">🐢</span>
           <h1 class="font-display font-700 text-xl tracking-tight">Turtle Cup</h1>
         </div>
-        <p class="text-[11px] text-[#7f9689] mt-0.5">Terrapin Ridge Golf Club · Team Match Play</p>
+        <p class="text-[11px] text-[#7f9689] mt-0.5">Terrapin Ridge Golf Club · Ryder Cup Format</p>
         <div class="flex items-center gap-1.5 mt-1.5">
           <span class="w-1.5 h-1.5 rounded-full ${syncDot}"></span>
           <span class="text-[10px] font-medium ${syncText}">${syncLabel}</span>
@@ -333,17 +413,37 @@ function renderHeader(){
         <button data-action="toggle-admin" title="Admin Mode" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.admin.enabled ? 'bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#d9b25c]'}">${STATE.admin.enabled ? '🔓' : '🔒'}</button>
       </div>
     </div>
-    ${STATE.admin.enabled ? renderAdminPanel() : ''}
-    <div class="px-4 pb-3 pt-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-[#d9b25c] font-semibold">
-      <span class="h-px flex-1 bg-[#2a3a2c]"></span><span>Team Standings</span><span class="h-px flex-1 bg-[#2a3a2c]"></span>
+
+    <div class="px-4 pb-4">
+      <div class="flex items-end justify-between">
+        <div class="text-left">
+          <div class="text-[11px] font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</div>
+          <div class="font-display font-700 text-3xl leading-none" style="color:${RED}">${st.red.toFixed(1)}</div>
+        </div>
+        <div class="text-center pb-1">
+          <div class="text-[9px] uppercase tracking-wider text-[#7f9689]">Target to Win</div>
+          <div class="font-display font-600 text-sm text-[#d9b25c]">${st.target.toFixed(1)}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-[11px] font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</div>
+          <div class="font-display font-700 text-3xl leading-none" style="color:${BLUE}">${st.blue.toFixed(1)}</div>
+        </div>
+      </div>
+      <div class="flex h-2 rounded-full overflow-hidden bg-[#161f1a] mt-2 border border-[#243527]">
+        <div style="width:${redPct}%; background:${RED}"></div>
+        <div class="flex-1"></div>
+        <div style="width:${bluePct}%; background:${BLUE}"></div>
+      </div>
+      <div class="text-[10px] text-[#5c6f61] mt-1 text-center">${st.totalAvailable.toFixed(1)} points scheduled across ${Object.keys(MATCH_META).reduce((n,m)=>n+allPairingIds(m).length,0)} matchups</div>
     </div>
-    <div class="px-4 pb-4 flex gap-2 overflow-x-auto">${cards}</div>
+
+    ${STATE.admin.enabled ? renderAdminMaintenancePanel() : ''}
   </div>`;
 }
 
-function renderAdminPanel(){
+function renderAdminMaintenancePanel(){
   return `
-  <div class="mx-4 mt-1 rounded-xl border border-[#7d6a2f] bg-[#201a0c] p-3 fade-in">
+  <div class="mx-4 mb-4 rounded-xl border border-[#7d6a2f] bg-[#201a0c] p-3 fade-in">
     <div class="flex items-center justify-between mb-2">
       <span class="text-xs font-semibold text-[#f2d17f]">🛠️ Admin &amp; Maintenance</span>
       <span class="text-[10px] text-[#c9a54e]">Score override active on all cards</span>
@@ -359,10 +459,13 @@ function renderAdminPanel(){
   </div>`;
 }
 
+/* =========================================================
+   RENDERING — NAV
+   ========================================================= */
 function renderNav(){
   const tabs = [
     ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label.replace('Match ','M') })),
-    { id:'teams', label:'Teams' },
+    { id:'admin', label:'Admin' },
   ];
   return `
   <div class="sticky top-0 z-20 bg-[#0a100c]/95 backdrop-blur border-b border-[#1c2a20] px-3 py-2">
@@ -381,58 +484,37 @@ function pillRow(items, selectedIdx, groupAttr){
   `).join('')}</div>`;
 }
 
-function matchupLabel(pair){
-  const a = STATE.teams[pair.a], b = STATE.teams[pair.b];
-  return `${a.name} vs ${b.name}`;
-}
-
-function banner(evalr, matchId, pairIdx, sub){
-  const { final, currentDiff, enteredCount, teamA, teamB } = evalr;
-  const aIdx = teamIdxById(teamA.id), bIdx = teamIdxById(teamB.id);
-  let text, sub2 = '', tone = 'neutral';
-
-  if(final.finished){
-    if(final.winner==='halved'){
-      text = 'Match Halved — All Square'; tone='halved';
-    } else {
-      const w = final.winner==='a' ? teamA : teamB;
-      text = `${escapeHtml(w.name)} win ${final.closeout}`; tone='decided';
-    }
-    sub2 = `Points — ${escapeHtml(teamA.name)} ${final.pointsA.toFixed(1)} · ${escapeHtml(teamB.name)} ${final.pointsB.toFixed(1)}`;
-  } else if(enteredCount===0){
-    text = 'Match not started'; tone='idle';
-  } else if(currentDiff===0){
-    text = `All Square thru ${enteredCount}`; tone='idle';
-  } else {
-    const leader = currentDiff>0 ? teamA : teamB;
-    text = `${escapeHtml(leader.name)} ${Math.abs(currentDiff)} UP thru ${enteredCount}`; tone='live';
-  }
-
+/* =========================================================
+   RENDERING — MATCH SCORECARDS
+   ========================================================= */
+function segmentBadges(segments){
   const toneClasses = {
     decided: 'bg-[#123a22] border-[#2f7d4f] text-[#7be6a4]',
     halved: 'bg-[#3a2f12] border-[#7d6a2f] text-[#f2d17f]',
     live: 'bg-[#132436] border-[#2f5a7d] text-[#8fc4f2]',
     idle: 'bg-[#161f1a] border-[#243527] text-[#9db3a4]',
   };
-
-  let lockTag = '';
-  if(final.finished){
-    lockTag = STATE.admin.enabled
-      ? `<span class="ml-auto flex-shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#3a2f12] text-[#f2d17f] border border-[#7d6a2f]">✏️ Admin Override</span>`
-      : `<span class="ml-auto flex-shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#161f1a] text-[#7f9689] border border-[#243527]">🔒 Final</span>`;
-  }
-
-  return `
-  <div class="mx-4 mt-3 rounded-xl border px-3 py-2.5 ${toneClasses[tone]} fade-in">
-    <div class="flex items-center gap-2">
-      <span class="w-2 h-2 rounded-full flex-shrink-0" style="background:${teamColor(aIdx)}"></span>
-      <div class="font-display font-600 text-sm">${text}</div>
-      <span class="w-2 h-2 rounded-full flex-shrink-0" style="background:${teamColor(bIdx)}"></span>
-      ${lockTag}
-    </div>
-    ${sub2 ? `<div class="text-[11px] mt-1 opacity-80">${sub2}</div>` : ''}
-    ${final.finished && !STATE.admin.enabled ? `<div class="text-[10px] mt-1 opacity-70">Scorecard locked now that the match is decided. Enable Admin Mode to override.</div>` : ''}
-  </div>`;
+  const cells = segments.map(s => {
+    const f = s.final;
+    let text, tone, pts;
+    if(f.finished){
+      if(f.winner==='halved'){ text='Halved'; tone='halved'; }
+      else { text = `${f.winner==='a'?'RED':'BLUE'} ${f.closeout}`; tone='decided'; }
+      pts = `${f.pointsA.toFixed(1)}–${f.pointsB.toFixed(1)}`;
+    } else if(s.enteredCount===0){
+      text='Not started'; tone='idle'; pts='0.0–0.0';
+    } else if(s.currentDiff===0){
+      text=`AS thru ${s.enteredCount}`; tone='idle'; pts='0.0–0.0';
+    } else {
+      text = `${s.currentDiff>0?'RED':'BLUE'} ${Math.abs(s.currentDiff)}up`; tone='live'; pts='0.0–0.0';
+    }
+    return `<div class="rounded-lg border px-2 py-2 text-center ${toneClasses[tone]}">
+      <div class="text-[9px] uppercase tracking-wide opacity-70">${s.label}</div>
+      <div class="text-[11px] font-display font-600 mt-0.5">${text}</div>
+      <div class="text-[10px] mt-0.5 opacity-80">${pts} pts</div>
+    </div>`;
+  }).join('');
+  return `<div class="mx-4 mt-3 grid grid-cols-3 gap-2 fade-in">${cells}</div>`;
 }
 
 function inputCell(value, attrs, locked){
@@ -447,26 +529,36 @@ function statusCellText(diff){
   return diff>0 ? `${diff}↑` : `${Math.abs(diff)}↓`;
 }
 
-function renderBetterBallTable(matchId, pairIdx){
-  const evalr = evaluateMatch(matchId, pairIdx);
-  const { teamA, teamB, holesDetail, statusPerHole } = evalr;
-  const locked = evalr.final.finished && !STATE.admin.enabled;
+function lockNote(locked, finished){
+  if(!finished) return '';
+  return locked
+    ? `<div class="mx-4 mt-2 text-[10px] text-[#7f9689]">🔒 Overall match decided — scorecard locked. Enable Admin Mode to override.</div>`
+    : `<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though the match is final.</div>`;
+}
+
+function renderBetterBallTable(matchId, pairingId){
+  const evalr = evaluateMatch(matchId, pairingId);
+  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments } = evalr;
+  const finished = segments[2].final.finished;
+  const locked = finished && !STATE.admin.enabled;
+
   const rows = holesDetail.map((h,i) => `
     <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
       <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a1, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="a1"`, locked)}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a2, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="a2"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.a1, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a1"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.a2, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a2"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b1, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="b1"`, locked)}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b2, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="b2"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.b1, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b1"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.b2, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b2"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
       <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
     </tr>`).join('');
 
   return `
-  ${banner(evalr, matchId, pairIdx)}
+  ${segmentBadges(segments)}
+  ${lockNote(locked, finished)}
   <div class="mx-4 mt-3 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
     <table class="w-full text-[12px] border-collapse min-w-[560px]">
       <thead>
@@ -474,17 +566,17 @@ function renderBetterBallTable(matchId, pairIdx){
           <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
           <th class="px-2 py-2 font-medium">Par</th>
           <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamA.id))}">${escapeHtml(teamA.name)}</th>
-          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamB.id))}">${escapeHtml(teamB.name)}</th>
+          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</th>
+          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</th>
           <th class="px-2 py-2 font-medium">Status</th>
         </tr>
         <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
           <th class="sticky-col px-2 py-1"></th><th></th><th></th>
-          <th class="px-1 py-1 font-normal">${initials(teamA.players[0].name)}</th>
-          <th class="px-1 py-1 font-normal">${initials(teamA.players[1].name)}</th>
+          <th class="px-1 py-1 font-normal">${initials(redPlayers[0].name)}</th>
+          <th class="px-1 py-1 font-normal">${initials(redPlayers[1].name)}</th>
           <th class="px-1 py-1 font-normal">Net</th>
-          <th class="px-1 py-1 font-normal">${initials(teamB.players[0].name)}</th>
-          <th class="px-1 py-1 font-normal">${initials(teamB.players[1].name)}</th>
+          <th class="px-1 py-1 font-normal">${initials(bluePlayers[0].name)}</th>
+          <th class="px-1 py-1 font-normal">${initials(bluePlayers[1].name)}</th>
           <th class="px-1 py-1 font-normal">Net</th>
           <th></th>
         </tr>
@@ -492,30 +584,34 @@ function renderBetterBallTable(matchId, pairIdx){
       <tbody>${rows}</tbody>
     </table>
   </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received on that hole (raw handicap vs. hole SI). Team's Better Ball net = lower of its two players' net scores.</p>`;
+  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received (raw handicap vs. hole SI). Better Ball net = lower of the pair's two net scores. Each match awards up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).</p>`;
 }
 
-function renderPinehurstTable(matchId, pairIdx){
-  const evalr = evaluateMatch(matchId, pairIdx);
-  const { teamA, teamB, holesDetail, statusPerHole } = evalr;
-  const locked = evalr.final.finished && !STATE.admin.enabled;
+function renderPinehurstTable(matchId, pairingId){
+  const evalr = evaluateMatch(matchId, pairingId);
+  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments } = evalr;
+  const finished = segments[2].final.finished;
+  const locked = finished && !STATE.admin.enabled;
+  const hcpRed = holesDetail[0].hcpRed, hcpBlue = holesDetail[0].hcpBlue;
+
   const rows = holesDetail.map((h,i) => `
     <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
       <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="a"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairIdx}" data-hole="${i}" data-role="b"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
       <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
     </tr>`).join('');
 
   return `
-  ${banner(evalr, matchId, pairIdx)}
-  <div class="mx-4 mt-2 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
-    <span>Team Course Handicap — <b style="color:${teamColor(teamIdxById(teamA.id))}">${escapeHtml(teamA.name)}: ${teamHandicap(teamA)}</b></span>
-    <span><b style="color:${teamColor(teamIdxById(teamB.id))}">${escapeHtml(teamB.name)}: ${teamHandicap(teamB)}</b></span>
+  ${segmentBadges(segments)}
+  ${lockNote(locked, finished)}
+  <div class="mx-4 mt-3 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
+    <span>Team Course Handicap — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${hcpRed}</b></span>
+    <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${hcpBlue}</b></span>
   </div>
   <div class="mx-4 mt-2 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
     <table class="w-full text-[12px] border-collapse min-w-[440px]">
@@ -524,8 +620,8 @@ function renderPinehurstTable(matchId, pairIdx){
           <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
           <th class="px-2 py-2 font-medium">Par</th>
           <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamA.id))}">${escapeHtml(teamA.name)}</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamB.id))}">${escapeHtml(teamB.name)}</th>
+          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</th>
+          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</th>
           <th class="px-2 py-2 font-medium">Status</th>
         </tr>
         <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
@@ -538,31 +634,34 @@ function renderPinehurstTable(matchId, pairIdx){
       <tbody>${rows}</tbody>
     </table>
   </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: team handicap = combined course handicap ÷ 2 (rounded). One alternate-shot gross score per team per hole, netted against that team handicap.</p>`;
+  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: team handicap = combined course handicap ÷ 2 (rounded). One alternate-shot gross score per team per hole. Points: Holes 1–5 (1.0) + Holes 6–9 (1.0) + Overall (1.0).</p>`;
 }
 
-function renderSinglesTable(matchId, pairIdx, sub){
-  const evalr = evaluateMatch(matchId, pairIdx, sub);
-  const { teamA, teamB, holesDetail, statusPerHole } = evalr;
-  const locked = evalr.final.finished && !STATE.admin.enabled;
-  const pA = teamA.players[sub], pB = teamB.players[sub];
+function renderSinglesTable(matchId, pairingId){
+  const evalr = evaluateMatch(matchId, pairingId);
+  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments } = evalr;
+  const finished = segments[2].final.finished;
+  const locked = finished && !STATE.admin.enabled;
+  const rp = redPlayers[0], bp = bluePlayers[0];
+
   const rows = holesDetail.map((h,i) => `
     <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
       <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
       <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairIdx}" data-sub="${sub}" data-hole="${i}" data-role="a"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairIdx}" data-sub="${sub}" data-hole="${i}" data-role="b"`, locked)}</td>
+      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b"`, locked)}</td>
       <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
       <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
     </tr>`).join('');
 
   return `
-  ${banner(evalr, matchId, pairIdx, sub)}
-  <div class="mx-4 mt-2 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
-    <span>Full raw handicaps — <b style="color:${teamColor(teamIdxById(teamA.id))}">${escapeHtml(pA.name)}: ${pA.hcp}</b></span>
-    <span><b style="color:${teamColor(teamIdxById(teamB.id))}">${escapeHtml(pB.name)}: ${pB.hcp}</b></span>
+  ${segmentBadges(segments)}
+  ${lockNote(locked, finished)}
+  <div class="mx-4 mt-3 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
+    <span>Full raw handicaps — <b style="color:${RED}">${escapeHtml(rp.name)}: ${rp.hcp}</b></span>
+    <span><b style="color:${BLUE}">${escapeHtml(bp.name)}: ${bp.hcp}</b></span>
   </div>
   <div class="mx-4 mt-2 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
     <table class="w-full text-[12px] border-collapse min-w-[440px]">
@@ -571,8 +670,8 @@ function renderSinglesTable(matchId, pairIdx, sub){
           <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
           <th class="px-2 py-2 font-medium">Par</th>
           <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamA.id))}">${escapeHtml(pA.name)}</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${teamColor(teamIdxById(teamB.id))}">${escapeHtml(pB.name)}</th>
+          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(rp.name)}</th>
+          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(bp.name)}</th>
           <th class="px-2 py-2 font-medium">Status</th>
         </tr>
         <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
@@ -585,14 +684,12 @@ function renderSinglesTable(matchId, pairIdx, sub){
       <tbody>${rows}</tbody>
     </table>
   </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Singles Match Play: each player's full raw course handicap is applied hole-by-hole. Each singles result is worth 1.0 Ryder Cup point to the winning team.</p>`;
+  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Full raw handicap applied hole-by-hole. Points: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0) — up to 3.0 pts per singles match.</p>`;
 }
 
 function renderMatchTab(matchId){
   const meta = MATCH_META[matchId];
-  const pairs = STATE.pairs;
-  const validPairs = pairs.map((p,i)=>({...p, idx:i})).filter(p=>p.b!==null);
-  const byePairs = pairs.map((p,i)=>({...p, idx:i})).filter(p=>p.b===null);
+  const pairs = STATE.lineups[matchId] || [];
 
   let header = `
   <div class="px-4 pt-4">
@@ -600,77 +697,150 @@ function renderMatchTab(matchId){
     <p class="text-xs text-[#7f9689]">${meta.sub}</p>
   </div>`;
 
-  if(validPairs.length===0){
-    return header + `<p class="mx-4 mt-4 text-sm text-[#7f9689]">Add at least two teams to generate a matchup.</p>`;
+  if(pairs.length===0){
+    return header + `<p class="mx-4 mt-4 text-sm text-[#7f9689]">No pairings set for this match yet. Go to the <b>Admin</b> tab to build the lineup.</p>`;
   }
 
-  const pairIdx = Math.min(STATE.ui.pairing[matchId] || 0, validPairs.length-1);
-  const activePairing = validPairs[pairIdx].idx;
+  const pairIdx = Math.min(STATE.ui.pairing[matchId] || 0, pairs.length-1);
+  const activePairingId = pairs[pairIdx].id;
 
-  let body = pillRow(validPairs.map(p=>matchupLabel(STATE.pairs[p.idx])), pairIdx, `data-pairing-select-${matchId}`);
+  let body = pillRow(pairs.map(p=>pairingLabel(matchId,p)), pairIdx, `data-pairing-select-${matchId}`);
 
-  if(matchId==='m4'){
-    const pair = STATE.pairs[activePairing];
-    const teamA = STATE.teams[pair.a], teamB = STATE.teams[pair.b];
-    const singleIdx = STATE.ui.single[activePairing] || 0;
-    const subLabels = [
-      `${initials(teamA.players[0].name)} vs ${initials(teamB.players[0].name)}`,
-      `${initials(teamA.players[1].name)} vs ${initials(teamB.players[1].name)}`,
-    ];
-    body += pillRow(subLabels, singleIdx, `data-sub-select-${activePairing}`);
-    body += renderSinglesTable('m4', activePairing, singleIdx);
-  } else if(matchId==='m3'){
-    body += renderPinehurstTable('m3', activePairing);
-  } else {
-    body += renderBetterBallTable(matchId, activePairing);
-  }
-
-  if(byePairs.length){
-    body += `<p class="mx-4 mb-4 text-[11px] text-[#66786b]">Bye: ${byePairs.map(p=>escapeHtml(STATE.teams[STATE.pairs[p.idx].a].name)).join(', ')} (odd team count — no opponent this round).</p>`;
-  }
+  if(matchId==='m3') body += renderPinehurstTable(matchId, activePairingId);
+  else if(matchId==='m4') body += renderSinglesTable(matchId, activePairingId);
+  else body += renderBetterBallTable(matchId, activePairingId);
 
   return header + body;
 }
 
-function renderTeamsTab(){
-  const cards = STATE.teams.map((t,i) => `
-    <div class="mx-4 mb-3 rounded-xl border border-[#1f2f26] bg-[#0f1913] overflow-hidden">
-      <div class="flex items-center gap-2 px-3 py-2.5 border-b border-[#1c2a20]">
-        <span class="w-3 h-3 rounded-full flex-shrink-0" style="background:${teamColor(i)}"></span>
-        <input value="${escapeAttr(t.name)}" data-team="${t.id}" data-field="name"
-          class="team-field bg-transparent font-display font-600 text-sm flex-1 focus:outline-none border-b border-transparent focus:border-[#3fae6a]" />
-        ${STATE.teams.length>4 ? `<button data-action="remove-team" data-team-id="${t.id}" class="text-[#e2696f] text-xs px-2 py-1 rounded hover:bg-[#2a1418]">Remove</button>` : ''}
+/* =========================================================
+   RENDERING — ADMIN TAB (roster + captain lineup builder + maintenance)
+   ========================================================= */
+function playerOption(p, selectedId){
+  return `<option value="${p.id}" ${p.id===selectedId?'selected':''}>${escapeHtml(p.name)} (HCP ${p.hcp})</option>`;
+}
+
+function renderRosterSection(){
+  const totalCount = STATE.roster.red.length + STATE.roster.blue.length;
+  const balanced = STATE.roster.red.length === STATE.roster.blue.length;
+
+  function side(sideKey, color, label){
+    const players = STATE.roster[sideKey];
+    return `
+    <div class="flex-1 min-w-[150px]">
+      <div class="flex items-center gap-1.5 mb-1.5">
+        <span class="w-2.5 h-2.5 rounded-full" style="background:${color}"></span>
+        <input value="${escapeAttr(STATE.teamNames[sideKey])}" data-field="team-name" data-side="${sideKey}"
+          class="team-field bg-transparent font-display font-600 text-sm focus:outline-none border-b border-transparent focus:border-[#3fae6a] flex-1" />
       </div>
-      <div class="px-3 py-2 space-y-2">
-        ${t.players.map((pl,pi)=>`
-          <div class="flex items-center gap-2">
-            <input value="${escapeAttr(pl.name)}" data-team="${t.id}" data-player="${pi}" data-field="pname"
-              class="team-field flex-1 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#3fae6a]" />
-            <div class="flex items-center gap-1 text-xs text-[#7f9689]">
-              <span>HCP</span>
-              <input type="number" value="${pl.hcp}" data-team="${t.id}" data-player="${pi}" data-field="hcp"
-                class="team-field w-14 text-center bg-[#0e1712] border border-[#24352a] rounded-lg px-1 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#3fae6a]" />
-            </div>
+      <div class="space-y-1.5">
+        ${players.map(p => `
+          <div class="flex items-center gap-1 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5">
+            <input value="${escapeAttr(p.name)}" data-field="pname" data-side="${sideKey}" data-player="${p.id}"
+              class="team-field flex-1 min-w-0 bg-transparent text-xs focus:outline-none" />
+            <input type="number" value="${p.hcp}" data-field="phcp" data-side="${sideKey}" data-player="${p.id}"
+              class="team-field w-10 text-center bg-[#101a14] border border-[#243527] rounded text-xs py-0.5 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+            <button data-action="remove-player" data-side="${sideKey}" data-player="${p.id}" ${totalCount<=8?'disabled':''} class="text-[#e2696f] text-xs px-1 disabled:opacity-20 disabled:cursor-not-allowed">✕</button>
           </div>
         `).join('')}
       </div>
-    </div>`).join('');
+      <button data-action="add-player" data-side="${sideKey}" ${totalCount>=20?'disabled':''} class="mt-1.5 w-full text-[11px] font-medium py-1.5 rounded-lg border border-dashed border-[#3fae6a] text-[#7be6a4] disabled:opacity-30 disabled:cursor-not-allowed hover:bg-[#123a22]/30 transition">+ Add to ${escapeHtml(STATE.teamNames[sideKey])}</button>
+    </div>`;
+  }
 
   return `
-  <div class="px-4 pt-4 pb-2">
-    <h2 class="font-display font-700 text-lg">Teams &amp; Handicaps</h2>
-    <p class="text-xs text-[#7f9689]">4–8 two-man teams. Editing a handicap instantly recalculates net scores. Adding or removing a team resets scorecards and re-pairs matchups.</p>
+  <div class="px-4 pt-4">
+    <h2 class="font-display font-700 text-lg">Roster</h2>
+    <p class="text-xs text-[#7f9689]">${totalCount} players total (8–20 supported) ${balanced ? '· sides balanced ✅' : '· sides uneven ⚠️'}. Handicap edits recalculate every scorecard instantly.</p>
   </div>
-  ${cards}
-  <div class="mx-4 mb-6">
-    <button data-action="add-team" ${STATE.teams.length>=8?'disabled':''} class="w-full text-sm font-medium py-2.5 rounded-lg border border-dashed border-[#3fae6a] text-[#7be6a4] disabled:opacity-30 disabled:cursor-not-allowed hover:bg-[#123a22]/30 transition">+ Add Team ${STATE.teams.length>=8 ? '(max 8)' : ''}</button>
+  <div class="mx-4 mt-3 flex gap-3">
+    ${side('red', RED, 'Red')}
+    ${side('blue', BLUE, 'Blue')}
   </div>`;
+}
+
+function renderLineupSection(){
+  const cards = Object.keys(MATCH_META).map(mid => {
+    const meta = MATCH_META[mid];
+    const pairs = STATE.lineups[mid] || [];
+    const usedRed = new Set(pairs.flatMap(p => mid==='m4' ? [p.red] : p.red));
+    const usedBlue = new Set(pairs.flatMap(p => mid==='m4' ? [p.blue] : p.blue));
+    const availRed = STATE.roster.red.filter(p => !usedRed.has(p.id));
+    const availBlue = STATE.roster.blue.filter(p => !usedBlue.has(p.id));
+    const draft = STATE.ui.draft[mid];
+
+    const existing = pairs.map(p => `
+      <div class="flex items-center justify-between bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-1.5 text-xs">
+        <span>${escapeHtml(pairingLabel(mid, p))}</span>
+        <button data-action="remove-pairing" data-match="${mid}" data-pairing="${p.id}" class="text-[#e2696f] text-[11px] px-2 py-0.5 rounded hover:bg-[#2a1418]">Remove</button>
+      </div>`).join('');
+
+    let addForm;
+    if(mid==='m4'){
+      addForm = `
+        <div class="grid grid-cols-2 gap-2 mt-2">
+          <select data-action="draft-select" data-match="${mid}" data-field="r" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Red player…</option>
+            ${availRed.map(p=>playerOption(p, draft.r)).join('')}
+          </select>
+          <select data-action="draft-select" data-match="${mid}" data-field="b" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Blue player…</option>
+            ${availBlue.map(p=>playerOption(p, draft.b)).join('')}
+          </select>
+        </div>`;
+    } else {
+      addForm = `
+        <div class="grid grid-cols-2 gap-2 mt-2">
+          <select data-action="draft-select" data-match="${mid}" data-field="r1" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Red player 1…</option>
+            ${availRed.filter(p=>p.id!==draft.r2).map(p=>playerOption(p, draft.r1)).join('')}
+          </select>
+          <select data-action="draft-select" data-match="${mid}" data-field="r2" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Red player 2…</option>
+            ${availRed.filter(p=>p.id!==draft.r1).map(p=>playerOption(p, draft.r2)).join('')}
+          </select>
+          <select data-action="draft-select" data-match="${mid}" data-field="b1" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Blue player 1…</option>
+            ${availBlue.filter(p=>p.id!==draft.b2).map(p=>playerOption(p, draft.b1)).join('')}
+          </select>
+          <select data-action="draft-select" data-match="${mid}" data-field="b2" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+            <option value="">Blue player 2…</option>
+            ${availBlue.filter(p=>p.id!==draft.b1).map(p=>playerOption(p, draft.b2)).join('')}
+          </select>
+        </div>`;
+    }
+
+    return `
+    <div class="mx-4 mb-3 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+      <div class="flex items-center justify-between">
+        <span class="font-display font-600 text-sm">${meta.label}</span>
+        <span class="text-[10px] text-[#7f9689]">${meta.sub}</span>
+      </div>
+      <div class="space-y-1.5 mt-2">${existing || `<p class="text-[11px] text-[#66786b]">No pairings yet.</p>`}</div>
+      ${addForm}
+      <button data-action="add-pairing" data-match="${mid}" class="mt-2 w-full text-[11px] font-medium py-1.5 rounded-lg border border-dashed border-[#3fae6a] text-[#7be6a4] hover:bg-[#123a22]/30 transition">+ Add Pairing</button>
+    </div>`;
+  }).join('');
+
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">Captain Lineup Builder</h2>
+    <p class="text-xs text-[#7f9689]">Set independent 2-man pairings for Matches 1–3 and singles pairings for Match 4. A player can't be double-booked within the same match.</p>
+  </div>
+  ${cards}`;
+}
+
+function renderAdminTab(){
+  return `
+  ${renderRosterSection()}
+  ${renderLineupSection()}
+  ${!STATE.admin.enabled ? `<p class="mx-4 mb-6 text-[11px] text-[#5c6f61]">Roster and lineup edits are open to captains. Data export/import, tournament reset, and editing a finalized scorecard require Admin Mode (🔒 in the header, passcode protected).</p>` : `<div class="mx-4 mb-6"></div>`}`;
 }
 
 function renderApp(){
   const root = document.getElementById('root');
   let content;
-  if(STATE.ui.tab==='teams') content = renderTeamsTab();
+  if(STATE.ui.tab==='admin') content = renderAdminTab();
   else content = renderMatchTab(STATE.ui.tab);
 
   root.innerHTML = `
@@ -683,15 +853,49 @@ function renderApp(){
 }
 
 /* =========================================================
-   HELPERS
+   ADMIN: BACKUP / RECOVERY
    ========================================================= */
-function initials(name){
-  return name.split(' ').map(w=>w[0]).join('').toUpperCase();
+function exportData(){
+  const payload = {
+    app: 'turtle-cup-ryder', version: 1, exportedAt: new Date().toISOString(),
+    teamNames: STATE.teamNames, roster: STATE.roster, lineups: STATE.lineups, scores: STATE.scores,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `turtle-cup-ryder-backup-${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* =========================================================
+   DEMO DATA GENERATOR
+   ========================================================= */
+function randScore(par){
+  const wobble = [-1,-1,0,0,0,0,1,1,1,2];
+  return Math.max(2, par + wobble[Math.floor(Math.random()*wobble.length)]);
 }
-function escapeAttr(s){ return escapeHtml(s); }
+
+function fillDemoScores(){
+  Object.keys(MATCH_META).forEach(mid => {
+    (STATE.lineups[mid] || []).forEach(pair => {
+      const entry = STATE.scores[mid][pair.id];
+      const count = mid==='m3' ? 9 : 18;
+      const start = mid==='m3' ? 9 : 0;
+      for(let i=0;i<count;i++){
+        const par = PARS[start+i];
+        if(mid==='m1' || mid==='m2'){
+          entry.holes[i] = { a1:randScore(par), a2:randScore(par), b1:randScore(par), b2:randScore(par) };
+        } else {
+          entry.holes[i] = { a:randScore(par), b:randScore(par) };
+        }
+      }
+    });
+  });
+}
 
 /* =========================================================
    EVENT HANDLING
@@ -706,68 +910,90 @@ root.addEventListener('click', (e) => {
     const pBtn = e.target.closest(`[data-pairing-select-${mid}]`);
     if(pBtn){ STATE.ui.pairing[mid] = parseInt(pBtn.getAttribute(`data-pairing-select-${mid}`),10); renderApp(); return; }
   }
-  const subBtn = e.target.closest('[data-sub-select-0], [data-sub-select-1], [data-sub-select-2], [data-sub-select-3], [data-sub-select-4], [data-sub-select-5], [data-sub-select-6], [data-sub-select-7]');
-  if(subBtn){
-    for(const attr of subBtn.attributes){
-      if(attr.name.startsWith('data-sub-select-')){
-        const pairingIdx = attr.name.replace('data-sub-select-','');
-        STATE.ui.single[pairingIdx] = parseInt(attr.value,10);
-        renderApp();
-        return;
-      }
-    }
-  }
 
   const action = e.target.closest('[data-action]');
-  if(action){
-    const act = action.dataset.action;
-    if(act==='add-team'){
-      if(STATE.teams.length<8){
-        STATE.teams.push({ id:'t'+nextTeamNum, name:'New Team '+nextTeamNum, players:[
-          { id:'p'+nextPlayerNum, name:'Player A', hcp:15 },
-          { id:'p'+(nextPlayerNum+1), name:'Player B', hcp:15 },
-        ]});
-        nextTeamNum++; nextPlayerNum+=2;
-        buildScores();
-        renderApp();
-      }
-    } else if(act==='remove-team'){
-      if(STATE.teams.length>4){
-        STATE.teams = STATE.teams.filter(t=>t.id!==action.dataset.teamId);
-        buildScores();
-        renderApp();
-      }
-    } else if(act==='demo'){
-      fillDemoScores();
+  if(!action) return;
+  const act = action.dataset.action;
+
+  if(act==='demo'){
+    fillDemoScores();
+    renderApp();
+
+  } else if(act==='reset-scores'){
+    STATE.scores = buildScoresForLineups(STATE.lineups);
+    renderApp();
+
+  } else if(act==='toggle-admin'){
+    if(STATE.admin.enabled){
+      STATE.admin.enabled = false;
       renderApp();
-    } else if(act==='reset-scores'){
-      buildScores();
-      renderApp();
-    } else if(act==='toggle-admin'){
-      if(STATE.admin.enabled){
-        STATE.admin.enabled = false;
-        renderApp();
-      } else {
-        const pass = prompt('Enter admin passcode to unlock Admin Mode:');
-        if(pass===null) return;
-        if(pass===ADMIN_PASSCODE){
-          STATE.admin.enabled = true;
-          renderApp();
-        } else {
-          alert('Incorrect passcode.');
-        }
-      }
-    } else if(act==='export-data'){
-      exportData();
-    } else if(act==='hard-reset'){
-      if(confirm('This permanently erases all teams and scores and restores baseline mock data. Continue?')){
-        localStorage.removeItem(LS_KEY);
-        STATE.teams = defaultTeams();
-        buildScores();
-        recalcCounters();
-        renderApp();
-      }
+    } else {
+      const pass = prompt('Enter admin passcode to unlock Admin Mode:');
+      if(pass===null) return;
+      if(pass===ADMIN_PASSCODE){ STATE.admin.enabled = true; renderApp(); }
+      else alert('Incorrect passcode.');
     }
+
+  } else if(act==='export-data'){
+    exportData();
+
+  } else if(act==='hard-reset'){
+    if(confirm('This permanently erases all rosters, lineups and scores and restores baseline mock data. Continue?')){
+      localStorage.removeItem(LS_KEY);
+      STATE = defaultState();
+      recalcCounters();
+      renderApp();
+    }
+
+  } else if(act==='add-player'){
+    const side = action.dataset.side;
+    const total = STATE.roster.red.length + STATE.roster.blue.length;
+    if(total>=20) return;
+    const id = 'p'+nextPlayerNum; nextPlayerNum++;
+    STATE.roster[side].push({ id, name:'New Player', hcp:15 });
+    renderApp();
+
+  } else if(act==='remove-player'){
+    const side = action.dataset.side, pid = action.dataset.player;
+    const total = STATE.roster.red.length + STATE.roster.blue.length;
+    if(total<=8) return;
+    STATE.roster[side] = STATE.roster[side].filter(p=>p.id!==pid);
+    // strip this player from any lineup pairings and their scores
+    Object.keys(MATCH_META).forEach(mid => {
+      STATE.lineups[mid] = (STATE.lineups[mid]||[]).filter(pair => {
+        const involved = mid==='m4' ? [pair.red,pair.blue] : [...pair.red, ...pair.blue];
+        const hit = involved.includes(pid);
+        if(hit) delete STATE.scores[mid][pair.id];
+        return !hit;
+      });
+    });
+    renderApp();
+
+  } else if(act==='add-pairing'){
+    const mid = action.dataset.match;
+    const draft = STATE.ui.draft[mid];
+    const id = 'pair'+nextPairNum;
+    let pair;
+    if(mid==='m4'){
+      if(!draft.r || !draft.b) { alert('Choose one Red and one Blue player.'); return; }
+      pair = { id, red:draft.r, blue:draft.b };
+      STATE.ui.draft[mid] = { r:'', b:'' };
+    } else {
+      if(!draft.r1 || !draft.r2 || !draft.b1 || !draft.b2){ alert('Choose two Red players and two Blue players.'); return; }
+      pair = { id, red:[draft.r1,draft.r2], blue:[draft.b1,draft.b2] };
+      STATE.ui.draft[mid] = { r1:'', r2:'', b1:'', b2:'' };
+    }
+    nextPairNum++;
+    STATE.lineups[mid].push(pair);
+    STATE.scores[mid][id] = { holes: emptyHoles(mid) };
+    renderApp();
+
+  } else if(act==='remove-pairing'){
+    const mid = action.dataset.match, pid = action.dataset.pairing;
+    if(!confirm('Remove this pairing and its scorecard?')) return;
+    STATE.lineups[mid] = STATE.lineups[mid].filter(p=>p.id!==pid);
+    delete STATE.scores[mid][pid];
+    renderApp();
   }
 });
 
@@ -776,29 +1002,32 @@ root.addEventListener('change', (e) => {
     const el = e.target;
     if(el.disabled) return; // locked scorecard — admin mode required to override
     const matchId = el.dataset.match;
-    const pairing = parseInt(el.dataset.pairing,10);
+    const pairing = el.dataset.pairing;
     const hole = parseInt(el.dataset.hole,10);
     const role = el.dataset.role;
-    const sub = el.dataset.sub;
     const val = el.value === '' ? '' : Math.max(1, Math.min(15, parseInt(el.value,10) || 1));
-
-    let entry;
-    if(matchId==='m4'){
-      entry = STATE.scores.m4[pairing][parseInt(sub,10)];
-    } else {
-      entry = STATE.scores[matchId][pairing];
-    }
-    entry.holes[hole][role] = val;
+    STATE.scores[matchId][pairing].holes[hole][role] = val;
     renderApp();
+
   } else if(e.target.matches('.team-field')){
     const el = e.target;
-    const team = STATE.teams.find(t=>t.id===el.dataset.team);
-    if(!team) return;
     const field = el.dataset.field;
-    if(field==='name'){ team.name = el.value || team.name; }
-    else if(field==='pname'){ team.players[parseInt(el.dataset.player,10)].name = el.value || 'Player'; }
-    else if(field==='hcp'){ team.players[parseInt(el.dataset.player,10)].hcp = Math.max(0, parseInt(el.value,10) || 0); }
+    if(field==='team-name'){
+      STATE.teamNames[el.dataset.side] = el.value || STATE.teamNames[el.dataset.side];
+    } else if(field==='pname'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.name = el.value || 'Player';
+    } else if(field==='phcp'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.hcp = Math.max(0, parseInt(el.value,10) || 0);
+    }
     renderApp();
+
+  } else if(e.target.matches('[data-action="draft-select"]')){
+    const mid = e.target.dataset.match, field = e.target.dataset.field;
+    STATE.ui.draft[mid][field] = e.target.value;
+    renderApp();
+
   } else if(e.target.matches('[data-action="import-data"]')){
     const file = e.target.files && e.target.files[0];
     if(!file) return;
@@ -806,9 +1035,10 @@ root.addEventListener('change', (e) => {
     reader.onload = () => {
       try{
         const parsed = JSON.parse(reader.result);
-        if(!parsed || !Array.isArray(parsed.teams) || !parsed.scores) throw new Error('Invalid shape');
-        STATE.teams = parsed.teams;
-        STATE.pairs = parsed.pairs && parsed.pairs.length ? parsed.pairs : pairTeams();
+        if(!parsed || !parsed.roster || !parsed.lineups || !parsed.scores) throw new Error('Invalid shape');
+        STATE.teamNames = parsed.teamNames || STATE.teamNames;
+        STATE.roster = parsed.roster;
+        STATE.lineups = parsed.lineups;
         STATE.scores = parsed.scores;
         recalcCounters();
         renderApp();
@@ -835,62 +1065,10 @@ root.addEventListener('keydown', (e) => {
 });
 
 /* =========================================================
-   ADMIN: BACKUP / RECOVERY
-   ========================================================= */
-function exportData(){
-  const payload = {
-    app: 'turtle-cup', version: 1, exportedAt: new Date().toISOString(),
-    teams: STATE.teams, pairs: STATE.pairs, scores: STATE.scores,
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `turtle-cup-backup-${Date.now()}.json`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-/* =========================================================
-   DEMO DATA GENERATOR
-   ========================================================= */
-function randScore(par){
-  const wobble = [-1,-1,0,0,0,0,1,1,1,2];
-  return Math.max(2, par + wobble[Math.floor(Math.random()*wobble.length)]);
-}
-
-function fillDemoScores(){
-  STATE.pairs.forEach((pair, idx) => {
-    if(pair.b===null) return;
-    ['m1','m2'].forEach(mid => {
-      const entry = STATE.scores[mid][idx];
-      for(let i=0;i<18;i++){
-        const par = PARS[i];
-        entry.holes[i] = { a1:randScore(par), a2:randScore(par), b1:randScore(par), b2:randScore(par) };
-      }
-    });
-    const m3entry = STATE.scores.m3[idx];
-    for(let i=0;i<9;i++){
-      const par = PARS[9+i];
-      m3entry.holes[i] = { a:randScore(par), b:randScore(par) };
-    }
-    [0,1].forEach(sub => {
-      const entry = STATE.scores.m4[idx][sub];
-      for(let i=0;i<18;i++){
-        const par = PARS[i];
-        entry.holes[i] = { a:randScore(par), b:randScore(par) };
-      }
-    });
-  });
-}
-
-/* =========================================================
    BOOT
    ========================================================= */
 if(!loadState()){
-  buildScores();
+  STATE = defaultState();
 }
 recalcCounters();
 renderApp();
