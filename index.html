@@ -24,7 +24,6 @@
   .tab-inactive{ color:#8fa396; }
   .sticky-col{ position:sticky; left:0; background:#101a14; z-index:1; }
   th.sticky-col{ background:#16221a; z-index:2; }
-  .score-input:focus{ background:#16241b; }
   select{ color-scheme: dark; }
   .fade-in{ animation: fadein .18s ease-out; }
   @keyframes fadein{ from{opacity:0; transform:translateY(2px);} to{opacity:1; transform:translateY(0);} }
@@ -42,27 +41,28 @@ const BLUE = '#5aa9f2';
 
 // ---- Course database ---------------------------------------------------
 // Each course: id, name, rating (course rating), slope, pars[18], sis[18] (hole handicap index 1-18)
+// White-tee data pulled Aug 2026 from club/aggregator scorecards — see chat notes on per-course confidence.
 function baselineCourses(){
   return [
     {
-      id:'cA', name:'Terrapin Ridge', rating:71.4, slope:128,
-      pars:[4,5,3,4,4,3,5,4,4, 4,4,3,5,4,4,3,5,4],
-      sis: [5,1,17,9,3,15,7,13,11, 2,16,4,10,18,6,12,8,14],
+      id:'cA', name:'Arcadian Shores Golf Club', rating:69.3, slope:135,
+      pars:[5,3,5,4,4,4,4,3,4, 5,4,4,4,4,3,5,3,4],
+      sis: [8,4,10,12,2,6,18,16,14, 9,3,13,1,11,15,7,17,5],
     },
     {
-      id:'cB', name:'Shellback Dunes', rating:72.8, slope:135,
-      pars:[4,4,3,5,4,4,3,5,4, 5,4,3,4,4,5,3,4,4],
-      sis: [9,3,17,1,11,5,15,7,13, 4,14,18,8,2,12,6,16,10],
+      id:'cB', name:'Prestwick Country Club', rating:71.1, slope:126,
+      pars:[4,4,4,4,3,5,4,3,5, 4,4,5,3,4,4,3,5,4],
+      sis: [9,1,5,7,11,15,13,17,3, 10,14,12,18,4,8,16,2,6],
     },
     {
-      id:'cC', name:'Marsh Hollow', rating:70.2, slope:121,
-      pars:[4,3,5,4,4,3,5,4,4, 4,5,3,4,4,5,3,4,4],
-      sis: [7,15,1,11,5,17,3,13,9, 6,16,2,12,8,18,4,14,10],
+      id:'cC', name:'Arrowhead Country Club (Lakes/Waterway)', rating:69.5, slope:127,
+      pars:[4,4,5,4,3,4,4,3,5, 4,4,3,5,4,3,4,4,5],
+      sis: [6,14,8,16,18,12,2,10,4, 15,17,9,13,3,11,1,7,5],
     },
     {
-      id:'cD', name:'Cypress Cove', rating:73.5, slope:141,
-      pars:[5,4,3,4,4,5,3,4,4, 4,4,5,3,4,4,5,3,4],
-      sis: [3,11,17,7,1,13,9,15,5, 10,2,18,6,14,4,16,8,12],
+      id:'cD', name:'Tidewater Golf Club', rating:70.6, slope:135,
+      pars:[5,4,3,4,4,4,4,5,3, 4,4,3,5,4,4,5,3,4],
+      sis: [15,17,13,1,3,9,7,11,5, 10,2,14,6,8,18,16,12,4],
     },
   ];
 }
@@ -91,16 +91,16 @@ let nextCourseNum = 1;
 function baselineRoster(){
   return {
     red: [
-      { id:'p1', name:'Alex Morgan', hcp:9.4 },
-      { id:'p2', name:'Jamie Lee', hcp:13.1 },
-      { id:'p3', name:'Chris Park', hcp:6.2 },
-      { id:'p4', name:'Sam Rivera', hcp:16.5 },
+      { id:'p1', name:'Alex Morgan', nickname:'Ace', hcp:9.4 },
+      { id:'p2', name:'Jamie Lee', nickname:'JLee', hcp:13.1 },
+      { id:'p3', name:'Chris Park', nickname:'Parky', hcp:6.2 },
+      { id:'p4', name:'Sam Rivera', nickname:'Sammy', hcp:16.5 },
     ],
     blue: [
-      { id:'p5', name:'Jordan Blake', hcp:11.3 },
-      { id:'p6', name:'Taylor Kim', hcp:18.0 },
-      { id:'p7', name:'Casey Nguyen', hcp:8.7 },
-      { id:'p8', name:'Morgan Diaz', hcp:20.9 },
+      { id:'p5', name:'Jordan Blake', nickname:'JB', hcp:11.3 },
+      { id:'p6', name:'Taylor Kim', nickname:'TK', hcp:18.0 },
+      { id:'p7', name:'Casey Nguyen', nickname:'CQ', hcp:8.7 },
+      { id:'p8', name:'Morgan Diaz', nickname:'Mo', hcp:20.9 },
     ],
   };
 }
@@ -151,7 +151,7 @@ function buildScoresForLineups(lineups){
 function defaultState(){
   const lineups = baselineLineups();
   return {
-    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{} },
+    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{} },
     admin: { enabled:false },
     teamNames: { red:'Team Red', blue:'Team Blue' },
     roster: baselineRoster(),
@@ -191,7 +191,7 @@ function saveState(){
     localStorage.setItem(LS_KEY, JSON.stringify({
       teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, matchCourse: STATE.matchCourse,
       lineups: STATE.lineups, scores: STATE.scores,
-      ui: { tab: STATE.ui.tab, pairing: STATE.ui.pairing }, savedAt: Date.now(),
+      ui: { tab: STATE.ui.tab, pairing: STATE.ui.pairing, hole: STATE.ui.hole }, savedAt: Date.now(),
     }));
     lastSavedAt = Date.now();
   } catch(e){ /* storage unavailable — app still works in-memory */ }
@@ -209,7 +209,7 @@ function loadState(){
     STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
     STATE.lineups = parsed.lineups;
     STATE.scores = parsed.scores;
-    if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; }
+    if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
     lastSavedAt = parsed.savedAt || Date.now();
     return true;
   } catch(e){ return false; }
@@ -438,6 +438,10 @@ function computeStandings(){
    RENDERING — SHARED HELPERS
    ========================================================= */
 function initials(name){ return name.split(' ').map(w=>w[0]).join('').toUpperCase(); }
+function displayName(p){
+  if(p.nickname && p.nickname.trim()) return p.nickname.trim();
+  return p.name.split(' ')[0];
+}
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -445,10 +449,10 @@ function escapeAttr(s){ return escapeHtml(s); }
 
 function pairingLabel(matchId, pair){
   if(matchId==='m4'){
-    return `${initials(playerById(pair.red).name)} vs ${initials(playerById(pair.blue).name)}`;
+    return `${displayName(playerById(pair.red))} vs ${displayName(playerById(pair.blue))}`;
   }
-  const r = pair.red.map(id=>initials(playerById(id).name)).join('/');
-  const b = pair.blue.map(id=>initials(playerById(id).name)).join('/');
+  const r = pair.red.map(id=>displayName(playerById(id))).join('/');
+  const b = pair.blue.map(id=>displayName(playerById(id))).join('/');
   return `${r} vs ${b}`;
 }
 
@@ -600,18 +604,6 @@ function segmentBadges(segments){
   return `<div class="mx-4 mt-3 grid grid-cols-3 gap-2 fade-in">${cells}</div>`;
 }
 
-function inputCell(value, attrs, locked){
-  return `<input type="number" inputmode="numeric" min="1" max="15" value="${value}" ${locked ? 'disabled' : ''}
-    class="score-input w-9 text-center rounded-md py-1 text-[13px] focus:outline-none focus:ring-2 focus:ring-[#3fae6a] ${locked ? 'bg-[#0c130f] border border-[#1c2a20] text-[#5c6f61] cursor-not-allowed' : 'bg-[#0e1712] border border-[#24352a] text-[#eef3ee]'}"
-    ${attrs} />`;
-}
-
-function statusCellText(diff){
-  if(diff==null) return '—';
-  if(diff===0) return 'AS';
-  return diff>0 ? `${diff}↑` : `${Math.abs(diff)}↓`;
-}
-
 function lockNote(locked, finished){
   if(!finished) return '';
   return locked
@@ -619,161 +611,206 @@ function lockNote(locked, finished){
     : `<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though the match is final.</div>`;
 }
 
-function renderBetterBallTable(matchId, pairingId){
-  const evalr = evaluateMatch(matchId, pairingId);
-  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const locked = finished && !STATE.admin.enabled;
-
-  const rows = holesDetail.map((h,i) => `
-    <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
-      <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a1, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a1"`, locked)}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a2, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a2"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b1, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b1"`, locked)}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b2, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b2"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
-      <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
-    </tr>`).join('');
-
-  return `
-  ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
-  <div class="mx-4 mt-3 mb-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
-    <span style="color:${RED}"><b>${initials(redPlayers[0].name)}</b> Idx ${redPlayers[0].hcp.toFixed(1)} → CH ${courseHcps.red[0]}</span>
-    <span style="color:${RED}"><b>${initials(redPlayers[1].name)}</b> Idx ${redPlayers[1].hcp.toFixed(1)} → CH ${courseHcps.red[1]}</span>
-    <span style="color:${BLUE}"><b>${initials(bluePlayers[0].name)}</b> Idx ${bluePlayers[0].hcp.toFixed(1)} → CH ${courseHcps.blue[0]}</span>
-    <span style="color:${BLUE}"><b>${initials(bluePlayers[1].name)}</b> Idx ${bluePlayers[1].hcp.toFixed(1)} → CH ${courseHcps.blue[1]}</span>
-  </div>
-  <div class="mx-4 mt-2 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
-    <table class="w-full text-[12px] border-collapse min-w-[560px]">
-      <thead>
-        <tr class="bg-[#16221a] text-[#9db3a4]">
-          <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
-          <th class="px-2 py-2 font-medium">Par</th>
-          <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</th>
-          <th colspan="3" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</th>
-          <th class="px-2 py-2 font-medium">Status</th>
-        </tr>
-        <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
-          <th class="sticky-col px-2 py-1"></th><th></th><th></th>
-          <th class="px-1 py-1 font-normal">${initials(redPlayers[0].name)}</th>
-          <th class="px-1 py-1 font-normal">${initials(redPlayers[1].name)}</th>
-          <th class="px-1 py-1 font-normal">Net</th>
-          <th class="px-1 py-1 font-normal">${initials(bluePlayers[0].name)}</th>
-          <th class="px-1 py-1 font-normal">${initials(bluePlayers[1].name)}</th>
-          <th class="px-1 py-1 font-normal">Net</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-  </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Course Handicap = Index × (Slope/113) + (Rating − Par). Better Ball net = lower of the pair's two net scores. Each match awards up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).</p>`;
+/* ---------------------------------------------------------
+   Mobile single-hole scoring card — shared building blocks
+   --------------------------------------------------------- */
+function clampHole(matchId, holeCount){
+  const cur = STATE.ui.hole[matchId] ?? 0;
+  return Math.max(0, Math.min(cur, holeCount-1));
 }
 
-function renderPinehurstTable(matchId, pairingId){
+function holeStepper(matchId, curHole, holeCount){
+  return `
+  <div class="mx-4 mt-3 flex items-center justify-between gap-3">
+    <button data-action="prev-hole" data-match="${matchId}" ${curHole<=0?'disabled':''}
+      class="w-11 h-11 flex-shrink-0 rounded-full bg-[#16241b] border border-[#243527] text-xl text-[#eef3ee] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">‹</button>
+    <div class="text-[11px] text-[#7f9689] font-medium">Hole ${curHole+1} of ${holeCount}</div>
+    <button data-action="next-hole" data-match="${matchId}" ${curHole>=holeCount-1?'disabled':''}
+      class="w-11 h-11 flex-shrink-0 rounded-full bg-[#16241b] border border-[#243527] text-xl text-[#eef3ee] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">›</button>
+  </div>`;
+}
+
+function holeHeaderCard(h){
+  return `
+  <div class="mx-4 mt-2 rounded-2xl bg-gradient-to-b from-[#132018] to-[#0f1913] border border-[#1f2f26] px-4 py-4 text-center fade-in">
+    <div class="text-[9px] uppercase tracking-[0.2em] text-[#7f9689]">Hole</div>
+    <div class="font-display font-700 text-5xl leading-none mt-1 text-[#eef3ee]">${h.hole}</div>
+    <div class="flex items-center justify-center gap-5 mt-2.5 text-xs text-[#9db3a4]">
+      <span>Par&nbsp;<b class="text-[#eef3ee] font-display">${h.par}</b></span>
+      <span class="w-px h-3 bg-[#243527]"></span>
+      <span>Hole HCP&nbsp;<b class="text-[#eef3ee] font-display">${h.si}</b></span>
+    </div>
+  </div>`;
+}
+
+function holeDotStrip(matchId, holesDetail, curHole){
+  const dots = holesDetail.map((hh,i) => {
+    const isCurrent = i===curHole;
+    let bg = '#161f1a', border = '#243527', color = '#7f9689';
+    if(isCurrent){ bg = '#3fae6a'; border = '#3fae6a'; color = '#0a100c'; }
+    else if(hh.winner==='a'){ bg = 'rgba(251,106,106,0.18)'; border = RED; color = RED; }
+    else if(hh.winner==='b'){ bg = 'rgba(90,169,242,0.18)'; border = BLUE; color = BLUE; }
+    else if(hh.winner==='halved'){ bg = 'rgba(217,178,92,0.18)'; border = '#d9b25c'; color = '#d9b25c'; }
+    return `<button data-action="goto-hole" data-match="${matchId}" data-hole="${i}"
+      class="flex-shrink-0 w-8 h-8 rounded-full text-[11px] font-display font-600 flex items-center justify-center border active:scale-90 transition"
+      style="background:${bg}; border-color:${border}; color:${color};">${hh.hole}</button>`;
+  }).join('');
+  return `<div class="mx-4 mt-3 flex gap-1.5 overflow-x-auto pb-1">${dots}</div>`;
+}
+
+function strokeDots(strokes){
+  if(strokes<=0) return '';
+  const dots = Array.from({length: Math.min(strokes,2)}).map(()=>`<span class="text-[9px] text-[#d9b25c]">●</span>`).join('');
+  return `<span class="flex-shrink-0 inline-flex items-center gap-0.5 ml-1.5" title="Receives ${strokes} stroke${strokes>1?'s':''} this hole">${dots}</span>`;
+}
+
+function counterRow(name, subLabel, value, par, strokes, dataAttrs, locked, color){
+  const display = value === '' ? '–' : value;
+  return `
+  <div class="flex items-center justify-between gap-2 bg-[#0f1913] border border-[#1f2f26] rounded-xl px-3 py-2.5">
+    <div class="flex items-center gap-2 min-w-0">
+      <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${color}"></span>
+      <div class="min-w-0">
+        <div class="font-display font-600 text-sm truncate flex items-center">${escapeHtml(name)}${strokeDots(strokes)}</div>
+        ${subLabel ? `<div class="text-[10px] text-[#7f9689] truncate">${escapeHtml(subLabel)}</div>` : ''}
+      </div>
+    </div>
+    <div class="flex items-center gap-2.5 flex-shrink-0">
+      <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="-1"
+        class="w-11 h-11 rounded-full bg-[#16241b] border border-[#243527] text-xl font-display font-700 text-[#eef3ee] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">−</button>
+      <div class="w-9 text-center font-display font-700 text-2xl text-[#eef3ee]">${display}</div>
+      <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="1"
+        class="w-11 h-11 rounded-full bg-[#3fae6a] text-[#0a100c] text-xl font-display font-700 flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">+</button>
+    </div>
+  </div>`;
+}
+
+function resultToneClass(tone){
+  const map = {
+    red: 'bg-[#3a1220] border-[#7d2f3a] text-[#f2a1ab]',
+    blue: 'bg-[#132436] border-[#2f5a7d] text-[#8fc4f2]',
+    halved: 'bg-[#3a2f12] border-[#7d6a2f] text-[#f2d17f]',
+    idle: 'bg-[#161f1a] border-[#243527] text-[#9db3a4]',
+  };
+  return map[tone] || map.idle;
+}
+
+function holeResultStrip(h){
+  let text, tone;
+  if(h.winner===null){ text = 'Enter both sides\' scores to see the hole result'; tone = 'idle'; }
+  else if(h.winner==='halved'){ text = `Hole halved — both net ${h.aNet}`; tone = 'halved'; }
+  else {
+    const winnerName = h.winner==='a' ? STATE.teamNames.red : STATE.teamNames.blue;
+    text = `${escapeHtml(winnerName)} win the hole — net ${h.aNet} vs ${h.bNet}`;
+    tone = h.winner==='a' ? 'red' : 'blue';
+  }
+  return `<div class="mx-4 mt-3 rounded-xl border px-3 py-2.5 text-center text-xs font-medium fade-in ${resultToneClass(tone)}">${text}</div>`;
+}
+
+function sectionLabel(text, color){
+  return `<div class="text-[9px] uppercase tracking-widest font-semibold mt-2.5 mb-1.5 first:mt-0" style="color:${color}">${escapeHtml(text)}</div>`;
+}
+
+/* ---------------------------------------------------------
+   Format-specific hole cards
+   --------------------------------------------------------- */
+function renderBetterBallHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
-  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments, courseHcps } = evalr;
+  const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
   const finished = segments[2].final.finished;
   const locked = finished && !STATE.admin.enabled;
+  const holeCount = holesDetail.length;
+  const curHole = clampHole(matchId, holeCount);
+  const h = holesDetail[curHole];
 
-  const rows = holesDetail.map((h,i) => `
-    <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
-      <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
-      <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
-    </tr>`).join('');
+  const sA1 = strokesOnHole(courseHcps.red[0], h.si);
+  const sA2 = strokesOnHole(courseHcps.red[1], h.si);
+  const sB1 = strokesOnHole(courseHcps.blue[0], h.si);
+  const sB2 = strokesOnHole(courseHcps.blue[1], h.si);
+
+  const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
 
   return `
+  ${holeStepper(matchId, curHole, holeCount)}
+  ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
   ${lockNote(locked, finished)}
-  <div class="mx-4 mt-3 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
+  <div class="mx-4 mt-3">
+    ${sectionLabel(STATE.teamNames.red, RED)}
+    <div class="space-y-2">
+      ${counterRow(displayName(redPlayers[0]), null, h.raw.a1, h.par, sA1, attrs('a1'), locked, RED)}
+      ${counterRow(displayName(redPlayers[1]), null, h.raw.a2, h.par, sA2, attrs('a2'), locked, RED)}
+    </div>
+    ${sectionLabel(STATE.teamNames.blue, BLUE)}
+    <div class="space-y-2">
+      ${counterRow(displayName(bluePlayers[0]), null, h.raw.b1, h.par, sB1, attrs('b1'), locked, BLUE)}
+      ${counterRow(displayName(bluePlayers[1]), null, h.raw.b2, h.par, sB2, attrs('b2'), locked, BLUE)}
+    </div>
+  </div>
+  ${holeResultStrip(h)}
+  ${holeDotStrip(matchId, holesDetail, curHole)}
+  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. Each match awards up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).</p>`;
+}
+
+function renderPinehurstHoleCard(matchId, pairingId){
+  const evalr = evaluateMatch(matchId, pairingId);
+  const { holesDetail, segments, courseHcps } = evalr;
+  const finished = segments[2].final.finished;
+  const locked = finished && !STATE.admin.enabled;
+  const holeCount = holesDetail.length;
+  const curHole = clampHole(matchId, holeCount);
+  const h = holesDetail[curHole];
+
+  const sRed = strokesOnHole(courseHcps.red, h.si);
+  const sBlue = strokesOnHole(courseHcps.blue, h.si);
+  const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
+
+  return `
+  ${holeStepper(matchId, curHole, holeCount)}
+  ${holeHeaderCard(h)}
+  ${segmentBadges(segments)}
+  ${lockNote(locked, finished)}
+  <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
     <span>9-Hole Team Course Handicap — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
     <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
   </div>
-  <div class="mx-4 mt-2 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
-    <table class="w-full text-[12px] border-collapse min-w-[440px]">
-      <thead>
-        <tr class="bg-[#16221a] text-[#9db3a4]">
-          <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
-          <th class="px-2 py-2 font-medium">Par</th>
-          <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</th>
-          <th class="px-2 py-2 font-medium">Status</th>
-        </tr>
-        <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
-          <th class="sticky-col px-2 py-1"></th><th></th><th></th>
-          <th class="px-1 py-1 font-normal">Gross</th><th class="px-1 py-1 font-normal">Net</th>
-          <th class="px-1 py-1 font-normal">Gross</th><th class="px-1 py-1 font-normal">Net</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
+  <div class="mx-4 mt-2 space-y-2">
+    ${counterRow(STATE.teamNames.red, 'Alternate-shot team score', h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
+    ${counterRow(STATE.teamNames.blue, 'Alternate-shot team score', h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
   </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: each player's 9-hole Course Handicap ≈ (Index × Slope/113 + Rating − Par) ÷ 2, then the pair's two 9-hole handicaps are combined ÷ 2 for one team number. One alternate-shot gross score per team per hole. Points: Holes 1–5 (1.0) + Holes 6–9 (1.0) + Overall (1.0).</p>`;
+  ${holeResultStrip(h)}
+  ${holeDotStrip(matchId, holesDetail, curHole)}
+  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: each player's 9-hole Course Handicap ≈ (Index × Slope/113 + Rating − Par) ÷ 2, then the pair's two 9-hole handicaps are combined ÷ 2 for one team number. Points: Holes 1–5 (1.0) + Holes 6–9 (1.0) + Overall (1.0).</p>`;
 }
 
-function renderSinglesTable(matchId, pairingId){
+function renderSinglesHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
-  const { redPlayers, bluePlayers, holesDetail, statusPerHole, segments, courseHcps } = evalr;
+  const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
   const finished = segments[2].final.finished;
   const locked = finished && !STATE.admin.enabled;
+  const holeCount = holesDetail.length;
+  const curHole = clampHole(matchId, holeCount);
+  const h = holesDetail[curHole];
   const rp = redPlayers[0], bp = bluePlayers[0];
 
-  const rows = holesDetail.map((h,i) => `
-    <tr class="border-b border-[#182319] ${h.winner ? (h.winner==='a'?'bg-[#123a22]/25':(h.winner==='b'?'bg-[#3a1220]/20':'')) : ''}">
-      <td class="sticky-col px-2 py-1.5 text-[#9db3a4] font-medium">${h.hole}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.par}</td>
-      <td class="px-2 py-1.5 text-center text-[#7f9689]">${h.si}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.a, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="a"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.aNet ?? '—'}</td>
-      <td class="px-1 py-1.5">${inputCell(h.raw.b, `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${i}" data-role="b"`, locked)}</td>
-      <td class="px-2 py-1.5 text-center font-display font-600 text-[#7be6a4]">${h.bNet ?? '—'}</td>
-      <td class="px-2 py-1.5 text-center text-[#d9b25c] font-medium">${statusCellText(statusPerHole[i])}</td>
-    </tr>`).join('');
+  const sRed = strokesOnHole(courseHcps.red, h.si);
+  const sBlue = strokesOnHole(courseHcps.blue, h.si);
+  const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
 
   return `
+  ${holeStepper(matchId, curHole, holeCount)}
+  ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
   ${lockNote(locked, finished)}
-  <div class="mx-4 mt-3 mb-1 flex gap-3 text-[11px] text-[#9db3a4]">
-    <span><b style="color:${RED}">${escapeHtml(rp.name)}</b> Idx ${rp.hcp.toFixed(1)} → CH ${courseHcps.red}</span>
-    <span><b style="color:${BLUE}">${escapeHtml(bp.name)}</b> Idx ${bp.hcp.toFixed(1)} → CH ${courseHcps.blue}</span>
+  <div class="mx-4 mt-3 space-y-2">
+    ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
+    ${counterRow(displayName(bp), bp.name, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
   </div>
-  <div class="mx-4 mt-2 mb-2 overflow-x-auto rounded-xl border border-[#1f2f26]">
-    <table class="w-full text-[12px] border-collapse min-w-[440px]">
-      <thead>
-        <tr class="bg-[#16221a] text-[#9db3a4]">
-          <th class="sticky-col px-2 py-2 text-left font-medium">Hole</th>
-          <th class="px-2 py-2 font-medium">Par</th>
-          <th class="px-2 py-2 font-medium">SI</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${RED}">${escapeHtml(rp.name)}</th>
-          <th colspan="2" class="px-2 py-2 font-semibold" style="color:${BLUE}">${escapeHtml(bp.name)}</th>
-          <th class="px-2 py-2 font-medium">Status</th>
-        </tr>
-        <tr class="bg-[#121d17] text-[#7f9689] text-[10px]">
-          <th class="sticky-col px-2 py-1"></th><th></th><th></th>
-          <th class="px-1 py-1 font-normal">Gross</th><th class="px-1 py-1 font-normal">Net</th>
-          <th class="px-1 py-1 font-normal">Gross</th><th class="px-1 py-1 font-normal">Net</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-  </div>
-  <p class="mx-4 mb-4 text-[10px] text-[#66786b]">Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. Points: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0) — up to 3.0 pts per singles match.</p>`;
+  ${holeResultStrip(h)}
+  ${holeDotStrip(matchId, holesDetail, curHole)}
+  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. Points: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0) — up to 3.0 pts per singles match.</p>`;
 }
+
 
 function renderMatchTab(matchId){
   const meta = MATCH_META[matchId];
@@ -796,9 +833,9 @@ function renderMatchTab(matchId){
 
   let body = pillRow(pairs.map(p=>pairingLabel(matchId,p)), pairIdx, `data-pairing-select-${matchId}`);
 
-  if(matchId==='m3') body += renderPinehurstTable(matchId, activePairingId);
-  else if(matchId==='m4') body += renderSinglesTable(matchId, activePairingId);
-  else body += renderBetterBallTable(matchId, activePairingId);
+  if(matchId==='m3') body += renderPinehurstHoleCard(matchId, activePairingId);
+  else if(matchId==='m4') body += renderSinglesHoleCard(matchId, activePairingId);
+  else body += renderBetterBallHoleCard(matchId, activePairingId);
 
   return header + body;
 }
@@ -807,7 +844,7 @@ function renderMatchTab(matchId){
    RENDERING — ADMIN TAB (roster + captain lineup builder + maintenance)
    ========================================================= */
 function playerOption(p, selectedId){
-  return `<option value="${p.id}" ${p.id===selectedId?'selected':''}>${escapeHtml(p.name)} (Idx ${p.hcp.toFixed(1)})</option>`;
+  return `<option value="${p.id}" ${p.id===selectedId?'selected':''}>${escapeHtml(displayName(p))} — ${escapeHtml(p.name)} (Idx ${p.hcp.toFixed(1)})</option>`;
 }
 
 function renderRosterSection(){
@@ -826,6 +863,8 @@ function renderRosterSection(){
       <div class="space-y-1.5">
         ${players.map(p => `
           <div class="flex items-center gap-1 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5">
+            <input value="${escapeAttr(p.nickname||'')}" placeholder="Nickname" data-field="pnick" data-side="${sideKey}" data-player="${p.id}"
+              class="team-field w-16 flex-shrink-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-xs font-display font-600 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
             <input value="${escapeAttr(p.name)}" data-field="pname" data-side="${sideKey}" data-player="${p.id}"
               class="team-field flex-1 min-w-0 bg-transparent text-xs focus:outline-none" />
             <input type="number" step="0.1" value="${p.hcp}" data-field="phcp" data-side="${sideKey}" data-player="${p.id}" title="Handicap Index"
@@ -841,7 +880,7 @@ function renderRosterSection(){
   return `
   <div class="px-4 pt-4">
     <h2 class="font-display font-700 text-lg">Roster</h2>
-    <p class="text-xs text-[#7f9689]">${totalCount} players total (8–20 supported) ${balanced ? '· sides balanced ✅' : '· sides uneven ⚠️'}. The number next to each name is their Handicap Index — daily Course Handicap is derived per match from the assigned course's Slope &amp; Rating.</p>
+    <p class="text-xs text-[#7f9689]">${totalCount} players total (8–20 supported) ${balanced ? '· sides balanced ✅' : '· sides uneven ⚠️'}. Nicknames show on scorecards and pairings; the Index number drives Course Handicap on every match.</p>
   </div>
   <div class="mx-4 mt-3 flex gap-3">
     ${side('red', RED, 'Red')}
@@ -1108,7 +1147,7 @@ root.addEventListener('click', (e) => {
     const total = STATE.roster.red.length + STATE.roster.blue.length;
     if(total>=20) return;
     const id = 'p'+nextPlayerNum; nextPlayerNum++;
-    STATE.roster[side].push({ id, name:'New Player', hcp:15.0 });
+    STATE.roster[side].push({ id, name:'New Player', nickname:'', hcp:15.0 });
     renderApp();
 
   } else if(act==='remove-player'){
@@ -1176,22 +1215,41 @@ root.addEventListener('click', (e) => {
     const cid = action.dataset.course;
     STATE.ui.courseEditorOpen[cid] = !STATE.ui.courseEditorOpen[cid];
     renderApp();
+
+  } else if(act==='prev-hole'){
+    const mid = action.dataset.match;
+    STATE.ui.hole[mid] = Math.max(0, (STATE.ui.hole[mid]||0) - 1);
+    renderApp();
+
+  } else if(act==='next-hole'){
+    const mid = action.dataset.match;
+    const maxIdx = (mid==='m3' ? 9 : 18) - 1;
+    STATE.ui.hole[mid] = Math.min(maxIdx, (STATE.ui.hole[mid]||0) + 1);
+    renderApp();
+
+  } else if(act==='goto-hole'){
+    const mid = action.dataset.match;
+    STATE.ui.hole[mid] = parseInt(action.dataset.hole,10);
+    renderApp();
+
+  } else if(act==='score-adjust'){
+    if(action.disabled) return; // locked scorecard — admin mode required to override
+    const matchId = action.dataset.match;
+    const pairing = action.dataset.pairing;
+    const hole = parseInt(action.dataset.hole,10);
+    const role = action.dataset.role;
+    const par = parseInt(action.dataset.par,10) || 4;
+    const delta = parseInt(action.dataset.delta,10);
+    const entry = STATE.scores[matchId][pairing];
+    const cur = entry.holes[hole][role];
+    const base = cur === '' ? par : cur;
+    entry.holes[hole][role] = Math.max(1, Math.min(15, base + delta));
+    renderApp();
   }
 });
 
 root.addEventListener('change', (e) => {
-  if(e.target.matches('.score-input')){
-    const el = e.target;
-    if(el.disabled) return; // locked scorecard — admin mode required to override
-    const matchId = el.dataset.match;
-    const pairing = el.dataset.pairing;
-    const hole = parseInt(el.dataset.hole,10);
-    const role = el.dataset.role;
-    const val = el.value === '' ? '' : Math.max(1, Math.min(15, parseInt(el.value,10) || 1));
-    STATE.scores[matchId][pairing].holes[hole][role] = val;
-    renderApp();
-
-  } else if(e.target.matches('.team-field')){
+  if(e.target.matches('.team-field')){
     const el = e.target;
     const field = el.dataset.field;
     if(field==='team-name'){
@@ -1199,6 +1257,9 @@ root.addEventListener('change', (e) => {
     } else if(field==='pname'){
       const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
       if(p) p.name = el.value || 'Player';
+    } else if(field==='pnick'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.nickname = el.value;
     } else if(field==='phcp'){
       const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
       if(p) p.hcp = Math.max(0, parseFloat(el.value) || 0);
@@ -1250,18 +1311,6 @@ root.addEventListener('change', (e) => {
     };
     reader.readAsText(file);
     e.target.value = '';
-  }
-});
-
-// Enter key moves focus to next score input for fast entry
-root.addEventListener('keydown', (e) => {
-  if(e.key==='Enter' && e.target.matches('.score-input')){
-    e.preventDefault();
-    const inputs = Array.from(document.querySelectorAll('.score-input'));
-    const i = inputs.indexOf(e.target);
-    e.target.dispatchEvent(new Event('change', {bubbles:true}));
-    if(i>=0 && i<inputs.length-1) inputs[i+1].focus();
-    else e.target.blur();
   }
 });
 
