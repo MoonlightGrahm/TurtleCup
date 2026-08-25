@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>Turtle Cup — Ryder Cup Format</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -195,6 +196,7 @@ function saveState(){
     }));
     lastSavedAt = Date.now();
   } catch(e){ /* storage unavailable — app still works in-memory */ }
+  pushCloudState(false);
 }
 
 function loadState(){
@@ -218,6 +220,144 @@ function loadState(){
 function formatClock(ts){
   if(!ts) return '';
   return new Date(ts).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+}
+
+/* =========================================================
+   CLOUD SYNC (Supabase — optional, falls back to localStorage)
+   ========================================================= */
+const SUPA_CONFIG_KEY = 'turtleCupSupabaseConfig_v1';
+const CLOUD_TABLE = 'turtle_cup_state';
+const CLOUD_ROW_ID = 1;
+
+let supabaseClient = null;
+let supabaseChannel = null;
+let cloudStatus = 'idle'; // 'idle' | 'connecting' | 'connected' | 'error'
+let cloudError = '';
+let applyingRemoteUpdate = false;
+let cloudSyncTimer = null;
+let lastCloudPushAt = null;
+
+function loadSupabaseConfig(){
+  try{
+    const raw = localStorage.getItem(SUPA_CONFIG_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e){ return null; }
+}
+function saveSupabaseConfig(cfg){
+  try{ localStorage.setItem(SUPA_CONFIG_KEY, JSON.stringify(cfg)); } catch(e){ /* ignore */ }
+}
+function clearSupabaseConfig(){
+  try{ localStorage.removeItem(SUPA_CONFIG_KEY); } catch(e){ /* ignore */ }
+}
+
+// Pulls the fields that make up "tournament data" — same shape used for localStorage/export/import.
+function cloudPayloadFromState(){
+  return {
+    teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses,
+    matchCourse: STATE.matchCourse, lineups: STATE.lineups, scores: STATE.scores,
+  };
+}
+
+function applyRemoteState(data){
+  if(!data) return;
+  applyingRemoteUpdate = true;
+  try{
+    STATE.teamNames = data.teamNames || STATE.teamNames;
+    STATE.roster = data.roster || STATE.roster;
+    STATE.courses = data.courses || STATE.courses;
+    STATE.matchCourse = data.matchCourse || STATE.matchCourse;
+    STATE.lineups = data.lineups || STATE.lineups;
+    STATE.scores = data.scores || STATE.scores;
+    recalcCounters();
+    renderApp();
+  } finally {
+    applyingRemoteUpdate = false;
+  }
+}
+
+async function pushCloudState(immediate){
+  if(!supabaseClient || applyingRemoteUpdate) return;
+  const row = { id: CLOUD_ROW_ID, data: cloudPayloadFromState(), updated_at: new Date().toISOString() };
+  const doPush = async () => {
+    try{
+      const { error } = await supabaseClient.from(CLOUD_TABLE).upsert(row);
+      if(error) throw error;
+      lastCloudPushAt = Date.now();
+      if(cloudStatus!=='connected'){ cloudStatus='connected'; cloudError=''; renderApp(); }
+    } catch(e){
+      cloudStatus = 'error';
+      cloudError = e.message || 'Push failed';
+      renderApp();
+    }
+  };
+  if(immediate){ await doPush(); }
+  else {
+    clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = setTimeout(doPush, 600); // debounce rapid taps (score +/-, etc.)
+  }
+}
+
+function subscribeRealtime(){
+  if(!supabaseClient) return;
+  if(supabaseChannel){ try{ supabaseClient.removeChannel(supabaseChannel); } catch(e){} }
+  supabaseChannel = supabaseClient
+    .channel('turtle-cup-live')
+    .on('postgres_changes', { event:'*', schema:'public', table: CLOUD_TABLE, filter:`id=eq.${CLOUD_ROW_ID}` }, (payload) => {
+      if(payload.new && payload.new.data) applyRemoteState(payload.new.data);
+    })
+    .subscribe((status) => {
+      if(status==='CHANNEL_ERROR' || status==='TIMED_OUT'){
+        cloudStatus = 'error'; cloudError = 'Realtime subscription dropped'; renderApp();
+      }
+    });
+}
+
+async function connectSupabase(url, anonKey, { silent } = {}){
+  if(!url || !anonKey){
+    if(!silent) alert('Enter both the Supabase URL and anon key first.');
+    return false;
+  }
+  if(!window.supabase || !window.supabase.createClient){
+    cloudStatus = 'error'; cloudError = 'Supabase SDK failed to load from CDN';
+    if(!silent) renderApp();
+    return false;
+  }
+  cloudStatus = 'connecting'; cloudError = '';
+  if(!silent) renderApp();
+
+  try{
+    const client = window.supabase.createClient(url, anonKey);
+    const { data, error } = await client.from(CLOUD_TABLE).select('data').eq('id', CLOUD_ROW_ID).maybeSingle();
+    if(error) throw error;
+
+    supabaseClient = client;
+    if(data && data.data){
+      applyRemoteState(data.data); // adopt whatever's already live in the cloud
+    } else {
+      await pushCloudState(true); // first device to connect seeds the row
+    }
+    subscribeRealtime();
+    cloudStatus = 'connected'; cloudError = '';
+    saveSupabaseConfig({ url, anonKey });
+    renderApp();
+    return true;
+  } catch(e){
+    supabaseClient = null;
+    cloudStatus = 'error';
+    cloudError = e.message || 'Could not reach Supabase — check the URL, key, and that the table exists.';
+    renderApp();
+    return false;
+  }
+}
+
+function disconnectSupabase(){
+  if(supabaseChannel && supabaseClient){ try{ supabaseClient.removeChannel(supabaseChannel); } catch(e){} }
+  supabaseChannel = null;
+  supabaseClient = null;
+  cloudStatus = 'idle';
+  cloudError = '';
+  clearSupabaseConfig();
+  renderApp();
 }
 
 /* =========================================================
@@ -470,10 +610,19 @@ function courseBanner(course){
    ========================================================= */
 function renderHeader(){
   const st = computeStandings();
-  const online = navigator.onLine;
-  const syncLabel = online ? 'Online · Synced' : 'Offline · Cache Saved';
-  const syncDot = online ? 'bg-emerald-400' : 'bg-amber-400';
-  const syncText = online ? 'text-emerald-300' : 'text-amber-300';
+  let syncLabel, syncDot, syncText;
+  if(cloudStatus==='connected'){
+    syncLabel = '☁ Cloud Synced'; syncDot = 'bg-emerald-400'; syncText = 'text-emerald-300';
+  } else if(cloudStatus==='connecting'){
+    syncLabel = 'Connecting to cloud…'; syncDot = 'bg-amber-400 animate-pulse'; syncText = 'text-amber-300';
+  } else if(cloudStatus==='error'){
+    syncLabel = '⚠ Cloud error · Local only'; syncDot = 'bg-[#e2696f]'; syncText = 'text-[#f2a1ab]';
+  } else {
+    const online = navigator.onLine;
+    syncLabel = online ? 'Local only · Online' : 'Local only · Offline cache';
+    syncDot = online ? 'bg-emerald-400' : 'bg-amber-400';
+    syncText = online ? 'text-emerald-300' : 'text-amber-300';
+  }
 
   const totalForBar = Math.max(st.totalAvailable, 1);
   const redPct = (st.red/totalForBar)*100;
@@ -1025,8 +1174,69 @@ function renderLineupSection(){
   ${cards}`;
 }
 
+function renderCloudSyncSection(){
+  const cfg = loadSupabaseConfig();
+  const urlVal = cfg ? cfg.url : '';
+  const keyVal = cfg ? cfg.anonKey : '';
+
+  let statusBadge;
+  if(cloudStatus==='connected'){
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#123a22] border border-[#2f7d4f] text-[#7be6a4]">☁ Connected — live sync active</span>`;
+  } else if(cloudStatus==='connecting'){
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a2f12] border border-[#7d6a2f] text-[#f2d17f]">Connecting…</span>`;
+  } else if(cloudStatus==='error'){
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a1220] border border-[#7d2f3a] text-[#f2a1ab]">⚠ ${escapeHtml(cloudError||'Connection failed')}</span>`;
+  } else {
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#161f1a] border border-[#243527] text-[#9db3a4]">Not connected — using local storage only</span>`;
+  }
+
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">Cloud Sync</h2>
+    <p class="text-xs text-[#7f9689]">Connect a free Supabase project so every phone and the presentation screen share one live tournament — scores update on all devices instantly, no refresh needed.</p>
+  </div>
+  <div class="mx-4 mb-3 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="mb-2.5">${statusBadge}</div>
+    <div class="space-y-2">
+      <div>
+        <label class="text-[10px] text-[#7f9689] block mb-1">Supabase URL</label>
+        <input id="supabaseUrlInput" type="text" placeholder="https://xxxxxxxx.supabase.co" value="${escapeAttr(urlVal)}"
+          class="w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      </div>
+      <div>
+        <label class="text-[10px] text-[#7f9689] block mb-1">Supabase Anon (public) Key</label>
+        <input id="supabaseKeyInput" type="password" placeholder="eyJhbGciOi..." value="${escapeAttr(keyVal)}"
+          class="w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      </div>
+      <div class="flex gap-2 pt-1">
+        <button data-action="connect-cloud" class="flex-1 text-xs font-semibold py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Connect</button>
+        ${cfg ? `<button data-action="disconnect-cloud" class="text-xs font-medium px-3 py-2 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] active:scale-95 transition">Disconnect</button>` : ''}
+      </div>
+    </div>
+  </div>
+  <details class="mx-4 mb-5 text-[11px] text-[#7f9689]">
+    <summary class="cursor-pointer text-[#9db3a4] font-medium">First time? One-time Supabase table setup ▾</summary>
+    <div class="mt-2 space-y-2">
+      <p>1. Create a free project at supabase.com, then open the SQL editor and run:</p>
+      <pre class="bg-[#0e1712] border border-[#24352a] rounded-lg p-2 overflow-x-auto text-[10px] text-[#c9d8cd]">create table turtle_cup_state (
+  id bigint primary key,
+  data jsonb not null,
+  updated_at timestamptz default now()
+);
+alter table turtle_cup_state enable row level security;
+create policy "anon read" on turtle_cup_state for select using (true);
+create policy "anon write" on turtle_cup_state for insert with check (true);
+create policy "anon update" on turtle_cup_state for update using (true);
+alter publication supabase_realtime add table turtle_cup_state;</pre>
+      <p>2. Copy your Project URL and <b>anon public</b> key from Project Settings → API, paste them above, and hit Connect on every device you want synced.</p>
+      <p class="text-[#e2696f]">⚠ These policies make the table fully readable/writable by anyone with your URL + anon key — fine for a private group of golfers, not something to post publicly.</p>
+    </div>
+  </details>`;
+}
+
 function renderAdminTab(){
   return `
+  ${renderCloudSyncSection()}
   ${renderRosterSection()}
   ${renderCourseSection()}
   ${renderLineupSection()}
@@ -1394,6 +1604,18 @@ root.addEventListener('click', (e) => {
     STATE.ui.recap.session = action.dataset.session;
     renderApp();
 
+  } else if(act==='connect-cloud'){
+    const urlEl = document.getElementById('supabaseUrlInput');
+    const keyEl = document.getElementById('supabaseKeyInput');
+    const url = urlEl ? urlEl.value.trim() : '';
+    const anonKey = keyEl ? keyEl.value.trim() : '';
+    connectSupabase(url, anonKey);
+
+  } else if(act==='disconnect-cloud'){
+    if(confirm('Disconnect this device from cloud sync? Scores will keep saving locally only.')){
+      disconnectSupabase();
+    }
+
   } else if(act==='toggle-admin'){
     if(STATE.admin.enabled){
       STATE.admin.enabled = false;
@@ -1596,6 +1818,11 @@ if(!loadState()){
 }
 recalcCounters();
 renderApp();
+
+const savedCloudConfig = loadSupabaseConfig();
+if(savedCloudConfig && savedCloudConfig.url && savedCloudConfig.anonKey){
+  connectSupabase(savedCloudConfig.url, savedCloudConfig.anonKey, { silent:true });
+}
 
 window.addEventListener('online', renderApp);
 window.addEventListener('offline', renderApp);
