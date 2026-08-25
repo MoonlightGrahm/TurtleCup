@@ -151,7 +151,7 @@ function buildScoresForLineups(lineups){
 function defaultState(){
   const lineups = baselineLineups();
   return {
-    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{} },
+    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' } },
     admin: { enabled:false },
     teamNames: { red:'Team Red', blue:'Team Blue' },
     roster: baselineRoster(),
@@ -495,6 +495,7 @@ function renderHeader(){
         </div>
       </div>
       <div class="flex gap-1.5 flex-shrink-0">
+        <button data-action="open-recap" title="Launch Post-Match Recap" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#241a0c] border border-[#7d6a2f] text-[#f2d17f] hover:border-[#d9b25c] active:scale-95 transition">📺 Recap</button>
         <button data-action="demo" title="Fill demo scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Demo</button>
         <button data-action="reset-scores" title="Clear all scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#e2696f] active:scale-95 transition">↺ Reset</button>
         <button data-action="toggle-admin" title="Admin Mode" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.admin.enabled ? 'bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#d9b25c]'}">${STATE.admin.enabled ? '🔓' : '🔒'}</button>
@@ -1032,6 +1033,265 @@ function renderAdminTab(){
   ${!STATE.admin.enabled ? `<p class="mx-4 mb-6 text-[11px] text-[#5c6f61]">Roster, course, and lineup edits are open to captains. Data export/import, tournament reset, and editing a finalized scorecard require Admin Mode (🔒 in the header, passcode protected).</p>` : `<div class="mx-4 mb-6"></div>`}`;
 }
 
+/* =========================================================
+   POST-MATCH RECAP — metrics computation
+   ========================================================= */
+function pairingStatusLine(evalr){
+  const overall = evalr.segments[2];
+  const f = overall.final;
+  if(f.finished){
+    return f.winner==='halved' ? 'Halved' : `${f.winner==='a'?STATE.teamNames.red:STATE.teamNames.blue} win ${f.closeout}`;
+  }
+  if(overall.enteredCount===0) return 'Not started';
+  if(overall.currentDiff===0) return `All Square thru ${overall.enteredCount}`;
+  return `${overall.currentDiff>0?STATE.teamNames.red:STATE.teamNames.blue} ${Math.abs(overall.currentDiff)} UP thru ${overall.enteredCount}`;
+}
+
+// Lower = tighter match. Decided halves score 0 (tightest possible). In-progress matches use the live gap.
+function marginOf(evalr){
+  const overall = evalr.segments[2];
+  const f = overall.final;
+  if(f.finished){
+    if(f.winner==='halved') return 0;
+    const amt = parseInt(String(f.closeout).split('&')[0], 10);
+    return isNaN(amt) ? 1 : amt;
+  }
+  return Math.abs(overall.currentDiff);
+}
+
+function collectSessionPairings(sessionIds){
+  const out = [];
+  sessionIds.forEach(mid => {
+    (STATE.lineups[mid] || []).forEach(pair => {
+      const evalr = evaluateMatch(mid, pair.id);
+      if(evalr) out.push({ matchId: mid, pairingId: pair.id, evalr });
+    });
+  });
+  return out;
+}
+
+function computeSessionMetrics(sessionIds){
+  const pairings = collectSessionPairings(sessionIds);
+
+  // ---- Low Net Medalist: lowest total net strokes among individually-scored players ----
+  const netTotals = {}; // playerId -> { name, color, total, holes }
+  function addNet(player, color, netVal){
+    if(netVal==null) return;
+    if(!netTotals[player.id]) netTotals[player.id] = { name: displayName(player), color, total: 0, holes: 0 };
+    netTotals[player.id].total += netVal;
+    netTotals[player.id].holes += 1;
+  }
+  pairings.forEach(({ matchId, evalr }) => {
+    if(matchId==='m1' || matchId==='m2'){
+      const { redPlayers, bluePlayers, holesDetail } = evalr;
+      holesDetail.forEach(h => {
+        addNet(redPlayers[0], RED, h.a1); addNet(redPlayers[1], RED, h.a2);
+        addNet(bluePlayers[0], BLUE, h.b1); addNet(bluePlayers[1], BLUE, h.b2);
+      });
+    } else if(matchId==='m4'){
+      const { redPlayers, bluePlayers, holesDetail } = evalr;
+      holesDetail.forEach(h => {
+        addNet(redPlayers[0], RED, h.aNet); addNet(bluePlayers[0], BLUE, h.bNet);
+      });
+    }
+    // m3 (Pinehurst) has no individual net breakdown — intentionally excluded from medalist race.
+  });
+  let medalist = null;
+  Object.values(netTotals).forEach(v => {
+    if(v.holes===0) return;
+    if(medalist===null || v.total < medalist.total) medalist = v;
+  });
+
+  // ---- Dogfight (tightest) & Hammer (biggest blowout) among matches with at least one hole entered ----
+  const withData = pairings.filter(pe => pe.evalr.segments[2].enteredCount > 0);
+  let dogfight = null, hammer = null;
+  withData.forEach(pe => {
+    const m = marginOf(pe.evalr);
+    if(dogfight===null || m < dogfight.margin) dogfight = { ...pe, margin: m };
+    if(hammer===null || m > hammer.margin) hammer = { ...pe, margin: m };
+  });
+
+  // ---- Birdie King: most gross birdies + net eagles, players individually or teams for Pinehurst ----
+  const birdieCounts = {}; // key -> { label, color, count }
+  function bump(key, label, color){
+    if(!birdieCounts[key]) birdieCounts[key] = { label, color, count: 0 };
+    birdieCounts[key].count += 1;
+  }
+  pairings.forEach(({ matchId, evalr }) => {
+    const { redPlayers, bluePlayers, holesDetail } = evalr;
+    if(matchId==='m1' || matchId==='m2'){
+      holesDetail.forEach(h => {
+        if(h.raw.a1!=='' && h.raw.a1===h.par-1) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
+        if(h.raw.a2!=='' && h.raw.a2===h.par-1) bump('p:'+redPlayers[1].id, displayName(redPlayers[1]), RED);
+        if(h.raw.b1!=='' && h.raw.b1===h.par-1) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
+        if(h.raw.b2!=='' && h.raw.b2===h.par-1) bump('p:'+bluePlayers[1].id, displayName(bluePlayers[1]), BLUE);
+        if(h.a1!=null && h.a1===h.par-2) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
+        if(h.a2!=null && h.a2===h.par-2) bump('p:'+redPlayers[1].id, displayName(redPlayers[1]), RED);
+        if(h.b1!=null && h.b1===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
+        if(h.b2!=null && h.b2===h.par-2) bump('p:'+bluePlayers[1].id, displayName(bluePlayers[1]), BLUE);
+      });
+    } else if(matchId==='m4'){
+      holesDetail.forEach(h => {
+        if(h.raw.a!=='' && h.raw.a===h.par-1) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
+        if(h.raw.b!=='' && h.raw.b===h.par-1) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
+        if(h.aNet!=null && h.aNet===h.par-2) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
+        if(h.bNet!=null && h.bNet===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
+      });
+    } else if(matchId==='m3'){
+      holesDetail.forEach(h => {
+        if(h.raw.a!=='' && h.raw.a===h.par-1) bump('team:red', STATE.teamNames.red, RED);
+        if(h.raw.b!=='' && h.raw.b===h.par-1) bump('team:blue', STATE.teamNames.blue, BLUE);
+        if(h.aNet!=null && h.aNet===h.par-2) bump('team:red', STATE.teamNames.red, RED);
+        if(h.bNet!=null && h.bNet===h.par-2) bump('team:blue', STATE.teamNames.blue, BLUE);
+      });
+    }
+  });
+  let birdieKing = null;
+  Object.values(birdieCounts).forEach(v => {
+    if(v.count===0) return;
+    if(birdieKing===null || v.count > birdieKing.count) birdieKing = v;
+  });
+
+  return { pairings, medalist, dogfight, hammer, birdieKing };
+}
+
+/* =========================================================
+   POST-MATCH RECAP — TV-ready overlay
+   ========================================================= */
+function awardCard(icon, title, body, sub){
+  return `
+  <div class="rounded-2xl border border-[#3a2f12] bg-gradient-to-b from-[#1a1408] to-[#120e06] px-5 py-5 flex flex-col items-center text-center gap-1.5">
+    <div class="text-3xl">${icon}</div>
+    <div class="text-[11px] uppercase tracking-[0.15em] text-[#d9b25c] font-semibold mt-1">${title}</div>
+    <div class="font-display font-700 text-xl md:text-2xl text-[#f5efe0] mt-0.5">${body}</div>
+    ${sub ? `<div class="text-xs text-[#a89a78] mt-0.5">${sub}</div>` : ''}
+  </div>`;
+}
+
+function recapMatchBreakdown(sessionIds){
+  return sessionIds.map(mid => {
+    const meta = MATCH_META[mid];
+    const pairs = STATE.lineups[mid] || [];
+    if(pairs.length===0) return '';
+    const cards = pairs.map(pair => {
+      const evalr = evaluateMatch(mid, pair.id);
+      if(!evalr) return '';
+      const segCells = evalr.segments.map(s => {
+        const f = s.final;
+        let text, cls;
+        if(f.finished){
+          if(f.winner==='halved'){ text = `Halved · 0.5–0.5`; cls='text-[#f2d17f]'; }
+          else { text = `${f.winner==='a'?STATE.teamNames.red:STATE.teamNames.blue} · ${f.pointsA.toFixed(1)}–${f.pointsB.toFixed(1)}`; cls = f.winner==='a' ? 'text-[#f2a1ab]' : 'text-[#8fc4f2]'; }
+        } else { text = 'In progress'; cls = 'text-[#7f9689]'; }
+        return `<div class="flex-1 min-w-0"><div class="text-[9px] uppercase tracking-wide text-[#7f9689]">${s.label}</div><div class="text-xs md:text-sm font-display font-600 truncate ${cls}">${text}</div></div>`;
+      }).join('');
+      return `
+      <div class="rounded-xl border border-[#243527] bg-[#101a14] px-4 py-3">
+        <div class="font-display font-600 text-sm md:text-base text-[#eef3ee] mb-2 truncate">${escapeHtml(pairingLabel(mid, pair))}</div>
+        <div class="flex gap-2">${segCells}</div>
+      </div>`;
+    }).join('');
+    return `
+    <div class="mb-5">
+      <div class="flex items-center gap-2 mb-2">
+        <h3 class="font-display font-700 text-base md:text-lg text-[#eef3ee]">${meta.label}</h3>
+        <span class="text-[11px] text-[#7f9689]">${meta.sub}</span>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5">${cards}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderRecapOverlay(){
+  if(!STATE.ui.recap.open) return '';
+  const session = STATE.ui.recap.session;
+  const sessionIds = session==='all' ? Object.keys(MATCH_META) : [session];
+  const metrics = computeSessionMetrics(sessionIds);
+  const st = computeStandings();
+  const totalForBar = Math.max(st.totalAvailable, 1);
+  const redPct = (st.red/totalForBar)*100;
+  const bluePct = (st.blue/totalForBar)*100;
+
+  const sessionTabs = [
+    ...Object.values(MATCH_META).map(m => ({ id: m.id, label: m.label })),
+    { id:'all', label:'Full Tournament' },
+  ];
+
+  const medalistBody = metrics.medalist ? `${escapeHtml(metrics.medalist.name)}` : '—';
+  const medalistSub = metrics.medalist ? `${metrics.medalist.total} net strokes · thru ${metrics.medalist.holes} holes` : 'No individually-scored holes yet';
+
+  const dogfightBody = metrics.dogfight ? escapeHtml(pairingLabel(metrics.dogfight.matchId, metrics.dogfight.evalr.pair)) : '—';
+  const dogfightSub = metrics.dogfight ? `${MATCH_META[metrics.dogfight.matchId].label} · ${pairingStatusLine(metrics.dogfight.evalr)}` : 'No matches underway yet';
+
+  const hammerBody = metrics.hammer ? escapeHtml(pairingLabel(metrics.hammer.matchId, metrics.hammer.evalr.pair)) : '—';
+  const hammerSub = metrics.hammer ? `${MATCH_META[metrics.hammer.matchId].label} · ${pairingStatusLine(metrics.hammer.evalr)}` : 'No matches underway yet';
+
+  const birdieBody = metrics.birdieKing ? escapeHtml(metrics.birdieKing.label) : '—';
+  const birdieSub = metrics.birdieKing ? `${metrics.birdieKing.count} birdie${metrics.birdieKing.count>1?'s':''}/eagle${metrics.birdieKing.count>1?'s':''} this session` : 'No birdies or net eagles yet';
+
+  return `
+  <div class="fixed inset-0 z-50 bg-[#05090c] overflow-y-auto shell-pattern">
+    <div class="max-w-6xl mx-auto px-5 md:px-10 py-8 md:py-12">
+
+      <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center gap-3">
+          <span class="text-3xl md:text-4xl">🐢</span>
+          <div>
+            <div class="font-display font-700 text-lg md:text-2xl text-[#f5efe0]">Turtle Cup — Post-Match Recap</div>
+            <div class="text-xs md:text-sm text-[#8fa396]">Terrapin Ridge Trail · Ryder Cup Format</div>
+          </div>
+        </div>
+        <button data-action="close-recap" class="w-11 h-11 rounded-full bg-[#16241b] border border-[#243527] text-2xl text-[#eef3ee] flex items-center justify-center active:scale-90 transition">×</button>
+      </div>
+
+      <div class="rounded-3xl border border-[#3a2f12] bg-gradient-to-b from-[#1a1408] to-[#0c0a05] px-6 md:px-10 py-8 mb-6">
+        <div class="flex items-center justify-center gap-2 mb-4">
+          <span class="h-px w-10 bg-[#7d6a2f]"></span>
+          <span class="text-[10px] md:text-xs uppercase tracking-[0.3em] text-[#d9b25c] font-semibold">🏆 Team Standings</span>
+          <span class="h-px w-10 bg-[#7d6a2f]"></span>
+        </div>
+        <div class="flex items-end justify-center gap-8 md:gap-16">
+          <div class="text-center">
+            <div class="text-sm md:text-lg font-semibold" style="color:${RED}">${escapeHtml(STATE.teamNames.red)}</div>
+            <div class="font-display font-700 text-6xl md:text-8xl leading-none" style="color:${RED}">${st.red.toFixed(1)}</div>
+          </div>
+          <div class="text-center pb-2 md:pb-4">
+            <div class="text-[10px] md:text-xs uppercase tracking-wider text-[#7f9689]">Target to Win</div>
+            <div class="font-display font-600 text-lg md:text-2xl text-[#d9b25c]">${st.target.toFixed(1)}</div>
+          </div>
+          <div class="text-center">
+            <div class="text-sm md:text-lg font-semibold" style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}</div>
+            <div class="font-display font-700 text-6xl md:text-8xl leading-none" style="color:${BLUE}">${st.blue.toFixed(1)}</div>
+          </div>
+        </div>
+        <div class="flex h-3 rounded-full overflow-hidden bg-[#161f1a] mt-6 border border-[#3a2f12] max-w-xl mx-auto">
+          <div style="width:${redPct}%; background:${RED}"></div>
+          <div class="flex-1"></div>
+          <div style="width:${bluePct}%; background:${BLUE}"></div>
+        </div>
+      </div>
+
+      <div class="flex gap-2 overflow-x-auto pb-1 mb-6">
+        ${sessionTabs.map(t => `
+          <button data-action="recap-session-select" data-session="${t.id}" class="flex-shrink-0 text-xs md:text-sm font-medium px-4 py-2 rounded-full border transition ${session===t.id ? 'bg-[#d9b25c] text-[#0a100c] border-[#d9b25c]' : 'bg-[#111c15] text-[#9db3a4] border-[#243527] hover:border-[#d9b25c]'}">${t.label}</button>
+        `).join('')}
+      </div>
+
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-8">
+        ${awardCard('🏆', 'Low Net Medalist', medalistBody, medalistSub)}
+        ${awardCard('⚡', 'The Dogfight', dogfightBody, dogfightSub)}
+        ${awardCard('🔨', 'The Hammer', hammerBody, hammerSub)}
+        ${awardCard('🐦', 'Birdie King', birdieBody, birdieSub)}
+      </div>
+
+      <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-3">Session Match Breakdown</h2>
+      ${recapMatchBreakdown(sessionIds) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
+
+      <div class="text-center text-[10px] text-[#5c6f61] mt-8 mb-4">Turtle Cup · Live recap — updates automatically as scores are entered</div>
+    </div>
+  </div>`;
+}
+
 function renderApp(){
   const root = document.getElementById('root');
   let content;
@@ -1042,6 +1302,7 @@ function renderApp(){
     ${renderHeader()}
     ${renderNav()}
     <div class="flex-1 pb-8">${content}</div>
+    ${renderRecapOverlay()}
   `;
 
   saveState();
@@ -1118,6 +1379,19 @@ root.addEventListener('click', (e) => {
 
   } else if(act==='reset-scores'){
     STATE.scores = buildScoresForLineups(STATE.lineups);
+    renderApp();
+
+  } else if(act==='open-recap'){
+    STATE.ui.recap.open = true;
+    if(!STATE.ui.recap.session) STATE.ui.recap.session = STATE.ui.tab in MATCH_META ? STATE.ui.tab : 'm1';
+    renderApp();
+
+  } else if(act==='close-recap'){
+    STATE.ui.recap.open = false;
+    renderApp();
+
+  } else if(act==='recap-session-select'){
+    STATE.ui.recap.session = action.dataset.session;
     renderApp();
 
   } else if(act==='toggle-admin'){
