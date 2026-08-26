@@ -80,28 +80,52 @@ const MATCH_META = {
   m4: { id:'m4', label:'Match 4', sub:'Sunday · Singles Match Play', format:'singles' },
 };
 
+// ---- Real-money wager / ledger schema enums ----------------------------
+const WAGER_TYPE = { MATCH_SEGMENT:'MATCH_SEGMENT', PRESS:'PRESS', PROP:'PROP' };
+const WAGER_STATUS = { OPEN:'OPEN', ACCEPTED:'ACCEPTED', DECLINED:'DECLINED', SETTLED:'SETTLED', PUSHED:'PUSHED' };
+const SEGMENT_ENUM = { FRONT_9:'FRONT_9', BACK_9:'BACK_9', OVERALL:'OVERALL' };
+const TX_TYPE = { WAGER_WIN:'WAGER_WIN', WAGER_LOSS:'WAGER_LOSS' };
+
 const LS_KEY = 'turtleCupRyderState_v2';
-const ADMIN_PASSCODE = '1234';
+const DEFAULT_ADMIN_PASSCODE = '1234'; // seeds STATE.admin.passcode — editable afterward from the Admin tab
+const ADMIN_SESSION_KEY = 'turtleCupAdminSession_v1';
 let lastSavedAt = null;
+// Admin authentication is deliberately per-browser-session, NOT part of STATE — it must never
+// sync via Supabase/localStorage tournament data, or unlocking on one phone would unlock every
+// connected device. sessionStorage clears when the tab closes, matching "unlock for this session".
+let adminAuthenticated = false;
+function loadAdminSession(){
+  try{ return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1'; } catch(e){ return false; }
+}
+function saveAdminSession(unlocked){
+  try{
+    if(unlocked) sessionStorage.setItem(ADMIN_SESSION_KEY, '1');
+    else sessionStorage.removeItem(ADMIN_SESSION_KEY);
+  } catch(e){ /* ignore */ }
+}
 let nextPlayerNum = 1;
 let nextPairNum = 1;
 let nextCourseNum = 1;
 
 // hcp here stores each player's Handicap Index (USGA-style, decimal) — daily Course
 // Handicap is now derived per-match from the assigned course's Slope & Rating.
+// wagerBalance is a running NET of settled wagers only (starts at $0 — it is not a prepaid
+// bankroll). Combined with the buy-in and purse share at Settlement time to get Final Net.
+function baselinePlayerStats(){ return { wagersWon: 0, wagersLost: 0 }; }
+
 function baselineRoster(){
   return {
     red: [
-      { id:'p1', name:'Alex Morgan', nickname:'Ace', hcp:9.4 },
-      { id:'p2', name:'Jamie Lee', nickname:'JLee', hcp:13.1 },
-      { id:'p3', name:'Chris Park', nickname:'Parky', hcp:6.2 },
-      { id:'p4', name:'Sam Rivera', nickname:'Sammy', hcp:16.5 },
+      { id:'p1', name:'Alex Morgan', nickname:'Ace', hcp:9.4, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p2', name:'Jamie Lee', nickname:'JLee', hcp:13.1, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p3', name:'Chris Park', nickname:'Parky', hcp:6.2, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p4', name:'Sam Rivera', nickname:'Sammy', hcp:16.5, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
     ],
     blue: [
-      { id:'p5', name:'Jordan Blake', nickname:'JB', hcp:11.3 },
-      { id:'p6', name:'Taylor Kim', nickname:'TK', hcp:18.0 },
-      { id:'p7', name:'Casey Nguyen', nickname:'CQ', hcp:8.7 },
-      { id:'p8', name:'Morgan Diaz', nickname:'Mo', hcp:20.9 },
+      { id:'p5', name:'Jordan Blake', nickname:'JB', hcp:11.3, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p6', name:'Taylor Kim', nickname:'TK', hcp:18.0, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p7', name:'Casey Nguyen', nickname:'CQ', hcp:8.7, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p8', name:'Morgan Diaz', nickname:'Mo', hcp:20.9, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
     ],
   };
 }
@@ -143,23 +167,41 @@ function buildScoresForLineups(lineups){
   Object.keys(MATCH_META).forEach(mid => {
     scores[mid] = {};
     (lineups[mid] || []).forEach(pair => {
-      scores[mid][pair.id] = { holes: emptyHoles(mid) };
+      scores[mid][pair.id] = { holes: emptyHoles(mid), finalized: false };
     });
   });
   return scores;
 }
 
+// Back-fills the `finalized` flag for scorecards saved before explicit finalization existed.
+function ensureScoreEntryFields(scores){
+  Object.keys(scores||{}).forEach(mid => {
+    Object.values(scores[mid]||{}).forEach(entry => {
+      if(typeof entry.finalized !== 'boolean') entry.finalized = false;
+    });
+  });
+  return scores;
+}
+
+function defaultPurseConfig(){
+  return { buyInPerPlayer: 100, winningTeamPct: 60, medalistPct: 25, trophyPoolPct: 15, defaultPressAmount: 20 };
+}
+
 function defaultState(){
   const lineups = baselineLineups();
   return {
-    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' } },
-    admin: { enabled:false },
+    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' }, modal:{ open:false, type:null },
+      wagerDraft: { kind:'match', matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', side:'red', propKind:'medalist', proposerPick:'', opponentPick:'' } },
+    admin: { passcode: DEFAULT_ADMIN_PASSCODE },
     teamNames: { red:'Team Red', blue:'Team Blue' },
     roster: baselineRoster(),
     courses: baselineCourses(),
     matchCourse: baselineMatchCourse(),
     lineups,
     scores: buildScoresForLineups(lineups),
+    purseConfig: defaultPurseConfig(),
+    wagers: [],
+    transactionLedger: [],
   };
 }
 
@@ -168,8 +210,11 @@ let STATE = defaultState();
 /* =========================================================
    PERSISTENCE (offline cache / localStorage sync)
    ========================================================= */
+let nextWagerNum = 1;
+let nextTxNum = 1;
+
 function recalcCounters(){
-  let maxP=0, maxPair=0, maxCourse=0;
+  let maxP=0, maxPair=0, maxCourse=0, maxWager=0, maxTx=0;
   [...STATE.roster.red, ...STATE.roster.blue].forEach(p=>{
     const n = parseInt(String(p.id).replace(/[^0-9]/g,''),10);
     if(!isNaN(n)) maxP = Math.max(maxP, n);
@@ -182,16 +227,42 @@ function recalcCounters(){
     const n = parseInt(String(c.id).replace(/[^0-9]/g,''),10);
     if(!isNaN(n)) maxCourse = Math.max(maxCourse, n);
   });
+  (STATE.wagers||[]).forEach(w=>{
+    const n = parseInt(String(w.wagerId).replace(/[^0-9]/g,''),10);
+    if(!isNaN(n)) maxWager = Math.max(maxWager, n);
+  });
+  (STATE.transactionLedger||[]).forEach(t=>{
+    const n = parseInt(String(t.transactionId).replace(/[^0-9]/g,''),10);
+    if(!isNaN(n)) maxTx = Math.max(maxTx, n);
+  });
   nextPlayerNum = maxP+1;
   nextPairNum = maxPair+1;
   nextCourseNum = maxCourse+1;
+  nextWagerNum = maxWager+1;
+  nextTxNum = maxTx+1;
+}
+
+// Back-fills money fields for rosters saved/imported from before this feature existed.
+function ensurePlayerMoneyFields(roster){
+  ['red','blue'].forEach(side=>{
+    (roster[side]||[]).forEach(p=>{
+      if(typeof p.wagerBalance !== 'number') p.wagerBalance = 0;
+      if(typeof p.venmo !== 'string') p.venmo = '';
+      if(typeof p.zelle !== 'string') p.zelle = '';
+      if(!p.stats || typeof p.stats !== 'object') p.stats = baselinePlayerStats();
+      if(typeof p.stats.wagersWon !== 'number') p.stats.wagersWon = 0;
+      if(typeof p.stats.wagersLost !== 'number') p.stats.wagersLost = 0;
+    });
+  });
+  return roster;
 }
 
 function saveState(){
   try{
     localStorage.setItem(LS_KEY, JSON.stringify({
       teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, matchCourse: STATE.matchCourse,
-      lineups: STATE.lineups, scores: STATE.scores,
+      lineups: STATE.lineups, scores: STATE.scores, admin: { passcode: STATE.admin.passcode },
+      purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
       ui: { tab: STATE.ui.tab, pairing: STATE.ui.pairing, hole: STATE.ui.hole }, savedAt: Date.now(),
     }));
     lastSavedAt = Date.now();
@@ -206,11 +277,15 @@ function loadState(){
     const parsed = JSON.parse(raw);
     if(!parsed || !parsed.roster || !parsed.lineups || !parsed.scores || !parsed.courses) return false;
     STATE.teamNames = parsed.teamNames || STATE.teamNames;
-    STATE.roster = parsed.roster;
+    STATE.roster = ensurePlayerMoneyFields(parsed.roster);
     STATE.courses = parsed.courses;
     STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
     STATE.lineups = parsed.lineups;
-    STATE.scores = parsed.scores;
+    STATE.scores = ensureScoreEntryFields(parsed.scores);
+    STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || DEFAULT_ADMIN_PASSCODE };
+    STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
+    STATE.wagers = parsed.wagers || [];
+    STATE.transactionLedger = parsed.transactionLedger || [];
     if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
     lastSavedAt = parsed.savedAt || Date.now();
     return true;
@@ -277,19 +352,74 @@ function cloudPayloadFromState(){
   return {
     teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses,
     matchCourse: STATE.matchCourse, lineups: STATE.lineups, scores: STATE.scores,
+    admin: { passcode: STATE.admin.passcode },
+    purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
   };
 }
 
+// Some preview/sandbox iframes (and a few browser extensions) wrap fetch and try to relay the raw
+// Response — including its non-cloneable Headers object — to a parent frame via postMessage for
+// logging. That relay throws a DataCloneError that has nothing to do with whether the actual
+// Supabase request succeeded, so we detect and ignore it rather than surfacing a false failure.
+function isSpuriousCloneError(e){
+  if(!e) return false;
+  const msg = e.message || String(e);
+  return e.name==='DataCloneError' || /could not be cloned/i.test(msg) || (/postMessage/i.test(msg) && /Headers/i.test(msg));
+}
+
+// True from the moment a local mutation is made until our own push of it has been confirmed
+// by Supabase. While true, incoming realtime payloads are NOT applied — our own in-flight write
+// represents the true latest state and will supersede whatever's still live in the row. This is
+// what stops "I tapped +1 and it flickered back" — without it, a remote snapshot captured before
+// our tap can land mid-flight and visibly revert the button the user just pressed.
+let pendingLocalChange = false;
+// Set when a push fails for a real reason (offline/low-signal) rather than success — the *state
+// itself* is the outbox here (we always push the latest full snapshot), so "queueing" just means
+// "keep retrying until it lands" rather than buffering individual deltas.
+let outboxPending = false;
+let retryTimer = null;
+
+// Any realtime payload that arrives while the user has an <input>/<textarea>/<select> focused is
+// held here instead of applied immediately, so a remote update can never yank a field out from
+// under someone mid-keystroke (Supabase URL/key, wager amount, roster name, custom prop label…).
+let queuedRemoteState = null;
+
+function isUserTypingInField(){
+  const el = document.activeElement;
+  if(!el) return false;
+  const tag = el.tagName;
+  return tag==='INPUT' || tag==='TEXTAREA' || tag==='SELECT';
+}
+
+// Flush any remote update that arrived while a field had focus, the moment focus leaves it.
+document.addEventListener('focusout', () => {
+  setTimeout(() => {
+    if(queuedRemoteState && !isUserTypingInField()){
+      const data = queuedRemoteState;
+      queuedRemoteState = null;
+      applyRemoteState(data);
+    }
+  }, 50); // let focus land on whatever's next (e.g. tabbing between fields) before deciding
+}, true); // focusout only bubbles with a capturing listener
+
 function applyRemoteState(data){
   if(!data) return;
+  if(isUserTypingInField()){
+    queuedRemoteState = data; // don't rip a field out from under an active edit — apply on blur
+    return;
+  }
   applyingRemoteUpdate = true;
   try{
     STATE.teamNames = data.teamNames || STATE.teamNames;
-    STATE.roster = data.roster || STATE.roster;
+    STATE.roster = ensurePlayerMoneyFields(data.roster || STATE.roster);
     STATE.courses = data.courses || STATE.courses;
     STATE.matchCourse = data.matchCourse || STATE.matchCourse;
     STATE.lineups = data.lineups || STATE.lineups;
-    STATE.scores = data.scores || STATE.scores;
+    STATE.scores = ensureScoreEntryFields(data.scores || STATE.scores);
+    STATE.admin = { passcode: (data.admin && data.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
+    STATE.purseConfig = { ...defaultPurseConfig(), ...(data.purseConfig||{}) };
+    STATE.wagers = data.wagers || [];
+    STATE.transactionLedger = data.transactionLedger || [];
     recalcCounters();
     renderApp();
   } finally {
@@ -299,24 +429,50 @@ function applyRemoteState(data){
 
 async function pushCloudState(immediate){
   if(!supabaseClient || applyingRemoteUpdate) return;
+  pendingLocalChange = true;
   const row = { id: CLOUD_ROW_ID, data: cloudPayloadFromState(), updated_at: new Date().toISOString() };
   const doPush = async () => {
     try{
       const { error } = await supabaseClient.from(CLOUD_TABLE).upsert(row);
       if(error) throw error;
       lastCloudPushAt = Date.now();
+      outboxPending = false;
+      pendingLocalChange = false;
+      clearTimeout(retryTimer);
       if(cloudStatus!=='connected'){ cloudStatus='connected'; cloudError=''; renderApp(); }
     } catch(e){
-      cloudStatus = 'error';
-      cloudError = e.message || 'Push failed';
+      if(isSpuriousCloneError(e)){
+        // The write almost certainly went through — only the browser's postMessage relay choked.
+        // Don't scare the user with a red error banner for something that isn't a sync problem.
+        console.warn('Turtle Cup: ignored a spurious DataCloneError while pushing to Supabase (likely a preview-sandbox postMessage relay, not a real failure).', e);
+        lastCloudPushAt = Date.now();
+        outboxPending = false;
+        pendingLocalChange = false;
+        if(cloudStatus!=='connected'){ cloudStatus='connected'; cloudError=''; renderApp(); }
+        return;
+      }
+      // Real failure — most likely offline or low signal. Keep the local edit exactly as the
+      // user left it (STATE already has it) and retry in the background rather than showing a
+      // scary error for a dropped bar of signal on the back nine.
+      outboxPending = true;
+      cloudStatus = navigator.onLine ? 'error' : 'offline-queued';
+      cloudError = e.message || 'Push failed — will retry automatically';
+      scheduleRetry();
       renderApp();
     }
   };
   if(immediate){ await doPush(); }
   else {
     clearTimeout(cloudSyncTimer);
-    cloudSyncTimer = setTimeout(doPush, 600); // debounce rapid taps (score +/-, etc.)
+    cloudSyncTimer = setTimeout(doPush, 500); // debounce rapid taps (score +/-, etc.)
   }
+}
+
+function scheduleRetry(){
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    if(outboxPending && supabaseClient) pushCloudState(true);
+  }, 4000);
 }
 
 function subscribeRealtime(){
@@ -325,7 +481,13 @@ function subscribeRealtime(){
   supabaseChannel = supabaseClient
     .channel('turtle-cup-live')
     .on('postgres_changes', { event:'*', schema:'public', table: CLOUD_TABLE, filter:`id=eq.${CLOUD_ROW_ID}` }, (payload) => {
-      if(payload.new && payload.new.data) applyRemoteState(payload.new.data);
+      if(!(payload.new && payload.new.data)) return;
+      if(pendingLocalChange){
+        // We have an edit not yet confirmed on the server — applying this snapshot now would
+        // visibly revert what the user just did. Our own pending push supersedes it shortly.
+        return;
+      }
+      applyRemoteState(payload.new.data);
     })
     .subscribe((status) => {
       if(status==='CHANNEL_ERROR' || status==='TIMED_OUT'){
@@ -378,6 +540,9 @@ function disconnectSupabase(){
   supabaseClient = null;
   cloudStatus = 'idle';
   cloudError = '';
+  outboxPending = false;
+  pendingLocalChange = false;
+  clearTimeout(retryTimer);
   clearSupabaseConfig();
   renderApp();
 }
@@ -628,6 +793,210 @@ function courseBanner(course){
 }
 
 /* =========================================================
+   REAL-MONEY ENGINE — buy-in, purse, wagers, settlement
+   ========================================================= */
+function round2(n){ return Math.round((n + Number.EPSILON) * 100) / 100; }
+function fmtMoney(n){
+  const sign = n < -0.005 ? '-' : '';
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+
+// Internal engine keeps using lowercase 'front9'|'back9'|'overall' keys (deeply wired into
+// computeSegments/evaluateMatch); these translate to/from the persisted SEGMENT_ENUM.
+function segLabel(matchId, segment){
+  if(segment==='overall') return 'Overall';
+  if(matchId==='m3') return segment==='front9' ? 'Holes 1–5' : 'Holes 6–9';
+  return segment==='front9' ? 'Front 9' : 'Back 9';
+}
+function segIndex(segment){ return segment==='front9' ? 0 : segment==='back9' ? 1 : 2; }
+function segToEnum(segment){ return segment==='front9' ? SEGMENT_ENUM.FRONT_9 : segment==='back9' ? SEGMENT_ENUM.BACK_9 : SEGMENT_ENUM.OVERALL; }
+function segFromEnum(segEnum){ return segEnum===SEGMENT_ENUM.FRONT_9 ? 'front9' : segEnum===SEGMENT_ENUM.BACK_9 ? 'back9' : 'overall'; }
+
+// A Press's `segment` is a descriptive hole-range string (e.g. "HOLES_3-9") rather than a fixed
+// FRONT_9/BACK_9/OVERALL enum, since it always covers "the remaining holes of the parent segment".
+function pressSegmentLabel(sessionId, parentSegment, startHoleIndex){
+  const segDef = sessionId==='m3'
+    ? (parentSegment==='front9' ? {s:0,e:5} : parentSegment==='back9' ? {s:5,e:9} : {s:0,e:9})
+    : (parentSegment==='front9' ? {s:0,e:9} : parentSegment==='back9' ? {s:9,e:18} : {s:0,e:18});
+  const { start } = holeRange(sessionId);
+  const startHoleNum = start + startHoleIndex + 1;
+  const endHoleNum = start + segDef.e;
+  return `HOLES_${startHoleNum}-${endHoleNum}`;
+}
+
+function playerStats(playerId){
+  const p = playerById(playerId);
+  if(p && !p.stats) p.stats = baselinePlayerStats();
+  return p ? p.stats : null;
+}
+
+// Applies a $ change to a player's running wager net and logs it to the audit ledger.
+function applyWagerLedger(playerId, amount, type, description){
+  const player = playerById(playerId);
+  if(!player || typeof player.wagerBalance !== 'number') return;
+  player.wagerBalance = round2(player.wagerBalance + amount);
+  STATE.transactionLedger.push({
+    transactionId: 'tx'+(nextTxNum++), timestamp: Date.now(), playerId, amount, type, description,
+  });
+  if(STATE.transactionLedger.length > 500) STATE.transactionLedger = STATE.transactionLedger.slice(-500);
+}
+
+// Resolves any ACCEPTED wagers tied to this session+match(pairing) once the relevant segment is decided.
+function settleWagersForPairing(sessionId, pairingId){
+  const evalr = evaluateMatch(sessionId, pairingId);
+  if(!evalr) return;
+
+  STATE.wagers.forEach(w => {
+    if(w.status!==WAGER_STATUS.ACCEPTED) return;
+    if(w.sessionId!==sessionId || w.matchId!==pairingId) return;
+
+    if(w.wagerType===WAGER_TYPE.MATCH_SEGMENT){
+      const seg = evalr.segments[segIndex(segFromEnum(w.segment))];
+      if(!seg.final.finished) return;
+      if(seg.final.winner==='halved'){
+        w.status=WAGER_STATUS.PUSHED; w.winnerId=null; w.settledAt=Date.now();
+        return;
+      }
+      const winnerTeam = seg.final.winner==='a' ? 'RED' : 'BLUE';
+      const creatorWon = w.targetTeam===winnerTeam;
+      const winnerId = creatorWon ? w.creatorId : w.acceptorId;
+      const loserId = creatorWon ? w.acceptorId : w.creatorId;
+      applyWagerLedger(winnerId, w.amount, TX_TYPE.WAGER_WIN, `Won ${fmtMoney(w.amount)} vs ${displayName(playerById(loserId))} — ${MATCH_META[sessionId].label} ${segLabel(sessionId, segFromEnum(w.segment))}`);
+      applyWagerLedger(loserId, -w.amount, TX_TYPE.WAGER_LOSS, `Lost ${fmtMoney(w.amount)} vs ${displayName(playerById(winnerId))} — ${MATCH_META[sessionId].label} ${segLabel(sessionId, segFromEnum(w.segment))}`);
+      const ws = playerStats(winnerId), ls = playerStats(loserId);
+      if(ws) ws.wagersWon += 1;
+      if(ls) ls.wagersLost += 1;
+      w.status=WAGER_STATUS.SETTLED; w.winnerId=winnerId; w.settledAt=Date.now();
+
+    } else if(w.wagerType===WAGER_TYPE.PRESS){
+      const parentSeg = w.parentSegment;
+      const segDef = sessionId==='m3'
+        ? (parentSeg==='front9' ? {s:0,e:5} : parentSeg==='back9' ? {s:5,e:9} : {s:0,e:9})
+        : (parentSeg==='front9' ? {s:0,e:9} : parentSeg==='back9' ? {s:9,e:18} : {s:0,e:18});
+      const results = evalr.holesDetail.slice(segDef.s, segDef.e).map(h=>h.winner);
+      const pressResults = results.slice(w.startHoleIndex - segDef.s);
+      const played = playMatch(pressResults);
+      if(!played.final.finished) return;
+      if(played.final.winner==='halved'){ w.status=WAGER_STATUS.PUSHED; w.winnerId=null; w.settledAt=Date.now(); return; }
+
+      const winTeam = played.final.winner==='a' ? 'red' : 'blue';
+      const loseTeam = winTeam==='red' ? 'blue' : 'red';
+      const teamPlayers = (team) => sessionId==='m4'
+        ? [team==='red'?evalr.redPlayers[0]:evalr.bluePlayers[0]]
+        : (team==='red'?evalr.redPlayers:evalr.bluePlayers);
+      teamPlayers(winTeam).forEach(p => applyWagerLedger(p.id, w.amount, TX_TYPE.WAGER_WIN, `Won the Press ${fmtMoney(w.amount)} — ${MATCH_META[sessionId].label} ${w.segment}`));
+      teamPlayers(loseTeam).forEach(p => applyWagerLedger(p.id, -w.amount, TX_TYPE.WAGER_LOSS, `Lost the Press ${fmtMoney(w.amount)} — ${MATCH_META[sessionId].label} ${w.segment}`));
+      teamPlayers(winTeam).forEach(p => { const s=playerStats(p.id); if(s) s.wagersWon += 1; });
+      teamPlayers(loseTeam).forEach(p => { const s=playerStats(p.id); if(s) s.wagersLost += 1; });
+      w.status=WAGER_STATUS.SETTLED; w.winnerId=null; w.targetTeam=winTeam.toUpperCase(); w.settledAt=Date.now();
+    }
+    // PROP wagers aren't tied to one pairing finishing — settled via the admin "settle-prop"
+    // action in Wager Central once the tournament-wide outcome (medalist/birdie king/custom) is known.
+  });
+}
+
+function settleAllWagers(){
+  Object.keys(MATCH_META).forEach(mid => {
+    allPairingIds(mid).forEach(pid => settleWagersForPairing(mid, pid));
+  });
+}
+
+// ---- Purse: buy-in pool split across Winning Team / Low Net Medalist / Trophy (Birdie King) ----
+function computePursePayouts(){
+  const allPlayers = [...STATE.roster.red, ...STATE.roster.blue];
+  const totalPlayers = allPlayers.length;
+  const cfg = STATE.purseConfig;
+  const totalPurse = round2(cfg.buyInPerPlayer * totalPlayers);
+  const winningPool = round2(totalPurse * cfg.winningTeamPct / 100);
+  const medalistPool = round2(totalPurse * cfg.medalistPct / 100);
+  const trophyPool = round2(totalPurse * cfg.trophyPoolPct / 100);
+
+  const payouts = {}; const notes = {};
+  allPlayers.forEach(p => { payouts[p.id] = 0; notes[p.id] = []; });
+
+  const standings = computeStandings();
+  let winningSide = null;
+  if(standings.red > standings.blue) winningSide = 'red';
+  else if(standings.blue > standings.red) winningSide = 'blue';
+
+  if(winningSide){
+    const team = STATE.roster[winningSide];
+    const share = team.length ? round2(winningPool / team.length) : 0;
+    team.forEach(p => { payouts[p.id] += share; notes[p.id].push(`Winning team share: ${fmtMoney(share)}`); });
+  } else if(totalPlayers){
+    const share = round2(winningPool / totalPlayers);
+    allPlayers.forEach(p => { payouts[p.id] += share; notes[p.id].push(`Standings tied — split evenly: ${fmtMoney(share)}`); });
+  }
+
+  const metrics = computeSessionMetrics(Object.keys(MATCH_META));
+  if(metrics.medalist && metrics.medalist.id){
+    payouts[metrics.medalist.id] += medalistPool;
+    notes[metrics.medalist.id].push(`Low Net Medalist pool: ${fmtMoney(medalistPool)}`);
+  } else if(totalPlayers){
+    const share = round2(medalistPool / totalPlayers);
+    allPlayers.forEach(p => { payouts[p.id] += share; notes[p.id].push(`No medalist yet — split evenly: ${fmtMoney(share)}`); });
+  }
+
+  if(metrics.birdieKing && metrics.birdieKing.id){
+    payouts[metrics.birdieKing.id] += trophyPool;
+    notes[metrics.birdieKing.id].push(`Birdie King trophy pool: ${fmtMoney(trophyPool)}`);
+  } else if(totalPlayers){
+    const share = round2(trophyPool / totalPlayers);
+    allPlayers.forEach(p => { payouts[p.id] += share; notes[p.id].push(`No individual birdie king yet — split evenly: ${fmtMoney(share)}`); });
+  }
+
+  return {
+    totalPurse, winningPool, medalistPool, trophyPool, payouts, notes, winningSide,
+    medalistId: metrics.medalist ? metrics.medalist.id : null,
+    birdieKingId: metrics.birdieKing ? metrics.birdieKing.id : null,
+  };
+}
+
+// Buy-In (paid in, negative) + Purse Share (paid out) + Wager Net = Final Net Balance.
+function computeFinalNetBalances(){
+  const purse = computePursePayouts();
+  const allPlayers = [...STATE.roster.red, ...STATE.roster.blue];
+  const rows = allPlayers.map(p => {
+    const buyIn = STATE.purseConfig.buyInPerPlayer;
+    const purseShare = purse.payouts[p.id] || 0;
+    const wagerNet = p.wagerBalance || 0;
+    const finalNet = round2(purseShare - buyIn + wagerNet);
+    return { player: p, buyIn, purseShare, wagerNet, finalNet, notes: purse.notes[p.id] || [] };
+  });
+  return { rows, purse };
+}
+
+// Greedy min-transaction debt settlement: repeatedly matches the biggest creditor against the
+// biggest debtor. Standard "simplify debts" approach (same idea Splitwise uses) — not formally
+// provably minimal for every possible distribution, but matches or beats it in practice and is
+// simple enough to audit by hand.
+function computeSettlementTransactions(rows){
+  const creditors = rows.filter(r => r.finalNet > 0.005).map(r => ({ id:r.player.id, name:displayName(r.player), amt:r.finalNet })).sort((a,b)=>b.amt-a.amt);
+  const debtors = rows.filter(r => r.finalNet < -0.005).map(r => ({ id:r.player.id, name:displayName(r.player), amt:-r.finalNet })).sort((a,b)=>b.amt-a.amt);
+  const txns = [];
+  let ci=0, di=0;
+  while(ci<creditors.length && di<debtors.length){
+    const c=creditors[ci], d=debtors[di];
+    const amt = round2(Math.min(c.amt, d.amt));
+    if(amt>0.005) txns.push({ fromId:d.id, fromName:d.name, toId:c.id, toName:c.name, amount:amt });
+    c.amt = round2(c.amt-amt); d.amt = round2(d.amt-amt);
+    if(c.amt<=0.005) ci++;
+    if(d.amt<=0.005) di++;
+  }
+  return txns;
+}
+
+function venmoDeepLink(handle, amount, note){
+  const clean = (handle||'').replace(/^@/,'').trim();
+  const params = `txn=pay&amount=${amount.toFixed(2)}&note=${encodeURIComponent(note)}`;
+  return clean ? `venmo://paycharge?recipients=${encodeURIComponent(clean)}&${params}` : `https://venmo.com/`;
+}
+function venmoWebLink(handle){
+  const clean = (handle||'').replace(/^@/,'').trim();
+  return clean ? `https://venmo.com/u/${encodeURIComponent(clean)}` : `https://venmo.com/`;
+}
+
+/* =========================================================
    RENDERING — HEADER
    ========================================================= */
 function renderHeader(){
@@ -637,6 +1006,8 @@ function renderHeader(){
     syncLabel = '☁ Cloud Synced'; syncDot = 'bg-emerald-400'; syncText = 'text-emerald-300';
   } else if(cloudStatus==='connecting'){
     syncLabel = 'Connecting to cloud…'; syncDot = 'bg-amber-400 animate-pulse'; syncText = 'text-amber-300';
+  } else if(cloudStatus==='offline-queued'){
+    syncLabel = '📴 Offline · Changes queued'; syncDot = 'bg-amber-400 animate-pulse'; syncText = 'text-amber-300';
   } else if(cloudStatus==='error'){
     syncLabel = '⚠ Cloud error · Local only'; syncDot = 'bg-[#e2696f]'; syncText = 'text-[#f2a1ab]';
   } else {
@@ -667,9 +1038,8 @@ function renderHeader(){
       </div>
       <div class="flex gap-1.5 flex-shrink-0">
         <button data-action="open-recap" title="Launch Post-Match Recap" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#241a0c] border border-[#7d6a2f] text-[#f2d17f] hover:border-[#d9b25c] active:scale-95 transition">📺 Recap</button>
-        <button data-action="demo" title="Fill demo scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Demo</button>
-        <button data-action="reset-scores" title="Clear all scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#e2696f] active:scale-95 transition">↺ Reset</button>
-        <button data-action="toggle-admin" title="Admin Mode" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.admin.enabled ? 'bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#d9b25c]'}">${STATE.admin.enabled ? '🔓' : '🔒'}</button>
+        <button data-tab="admin" title="Admin Panel" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.ui.tab==='admin' ? 'tab-active' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a]'}">${adminAuthenticated ? '🔓' : '🔐'} Admin</button>
+        ${adminAuthenticated ? `<button data-action="lock-admin" title="Lock Admin Mode" class="text-[11px] w-8 h-8 flex items-center justify-center rounded-lg border bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f] active:scale-95 transition">🔒</button>` : ''}
       </div>
     </div>
 
@@ -696,7 +1066,7 @@ function renderHeader(){
       <div class="text-[10px] text-[#5c6f61] mt-1 text-center">${st.totalAvailable.toFixed(1)} points scheduled across ${Object.keys(MATCH_META).reduce((n,m)=>n+allPairingIds(m).length,0)} matchups</div>
     </div>
 
-    ${STATE.admin.enabled ? renderAdminMaintenancePanel() : ''}
+    ${adminAuthenticated ? renderAdminMaintenancePanel() : ''}
   </div>`;
 }
 
@@ -713,7 +1083,13 @@ function renderAdminMaintenancePanel(){
         ⬆ Import Tournament Data
         <input type="file" accept="application/json" data-action="import-data" class="hidden" />
       </label>
-      <button data-action="hard-reset" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] hover:border-[#e2696f] active:scale-95 transition">⚠ Reset Tournament</button>
+    </div>
+    <div class="h-px bg-[#3a2f12] my-3"></div>
+    <div class="text-[10px] uppercase tracking-wide text-[#c9a54e] font-semibold mb-2">⚠ Destructive — affects every connected device</div>
+    <div class="flex flex-wrap gap-2">
+      <button data-action="open-modal" data-modal-type="demo" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Load Demo Data</button>
+      <button data-action="open-modal" data-modal-type="reset-scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#e2696f] active:scale-95 transition">↺ Reset Scores Only</button>
+      <button data-action="open-modal" data-modal-type="reset-tournament" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] hover:border-[#e2696f] active:scale-95 transition">⚠ Reset Tournament</button>
     </div>
   </div>`;
 }
@@ -723,14 +1099,15 @@ function renderAdminMaintenancePanel(){
    ========================================================= */
 function renderNav(){
   const tabs = [
-    ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label.replace('Match ','M') })),
-    { id:'admin', label:'Admin' },
+    ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label })),
+    { id:'wagers', label:'🎲 Wagers' },
+    { id:'settlement', label:'🤝 Settle' },
   ];
   return `
   <div class="sticky top-0 z-20 bg-[#0a100c]/95 backdrop-blur border-b border-[#1c2a20] px-3 py-2">
-    <div class="grid grid-cols-5 gap-1.5">
+    <div class="flex flex-wrap gap-1.5">
       ${tabs.map(t => `
-        <button data-tab="${t.id}" class="text-xs font-semibold py-2 rounded-lg transition ${STATE.ui.tab===t.id ? 'tab-active' : 'tab-inactive bg-[#111c15] border border-[#1f2f26] hover:border-[#3fae6a]'}">${t.label}</button>
+        <button data-tab="${t.id}" class="text-xs font-semibold px-3.5 py-2 rounded-lg transition whitespace-nowrap ${STATE.ui.tab===t.id ? 'tab-active' : 'tab-inactive bg-[#111c15] border border-[#1f2f26] hover:border-[#3fae6a]'}">${t.label}</button>
       `).join('')}
     </div>
   </div>`;
@@ -776,11 +1153,38 @@ function segmentBadges(segments){
   return `<div class="mx-4 mt-3 grid grid-cols-3 gap-2 fade-in">${cells}</div>`;
 }
 
-function lockNote(locked, finished){
-  if(!finished) return '';
-  return locked
-    ? `<div class="mx-4 mt-2 text-[10px] text-[#7f9689]">🔒 Overall match decided — scorecard locked. Enable Admin Mode to override.</div>`
-    : `<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though the match is final.</div>`;
+// A scorecard is only ready to auto-lock once every relevant raw score is in — mathematically
+// clinching the Overall match early (5&4, 8&7, etc.) does NOT by itself stop score entry, so Back 9
+// points, Press wagers, and tournament-wide Low Net totals can still be completed on the holes
+// still to be played.
+function allHolesEntered(matchId, holesDetail){
+  return holesDetail.every(h => (matchId==='m1' || matchId==='m2')
+    ? (h.raw.a1!=='' && h.raw.a2!=='' && h.raw.b1!=='' && h.raw.b2!=='')
+    : (h.raw.a!=='' && h.raw.b!==''));
+}
+
+function lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized){
+  const bits = [];
+  if(overallDecided && !scorecardComplete && !manuallyFinalized){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#8fc4f2]">🏁 Overall match decided — hole entry stays open so Back 9 points, Press wagers, and Low Net totals can still be completed. An admin can finalize early to lock now.</div>`);
+  }
+  if(locked){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#7f9689]">🔒 ${manuallyFinalized ? 'Finalized by admin' : 'All holes entered'} — scorecard locked. Enable Admin Mode to override.</div>`);
+  } else if(scorecardComplete || manuallyFinalized){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though it's ${manuallyFinalized ? 'finalized' : 'complete'}.</div>`);
+  }
+  return bits.join('');
+}
+
+function finalizeToggleButton(matchId, pairingId, manuallyFinalized){
+  if(!adminAuthenticated) return '';
+  return `
+  <div class="mx-4 mt-2">
+    <button data-action="toggle-finalize" data-match="${matchId}" data-pairing="${pairingId}"
+      class="w-full text-[11px] font-semibold py-2 rounded-lg border active:scale-95 transition ${manuallyFinalized ? 'bg-[#2a1418] border-[#7d2f3a] text-[#f2a1ab]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a]'}">
+      ${manuallyFinalized ? '↺ Reopen Scorecard' : '🏁 Finalize Scorecard Now (match conceded — skip remaining holes)'}
+    </button>
+  </div>`;
 }
 
 /* ---------------------------------------------------------
@@ -847,10 +1251,12 @@ function counterRow(name, subLabel, value, par, strokes, dataAttrs, locked, colo
         ${subLabel ? `<div class="text-[10px] text-[#7f9689] truncate">${escapeHtml(subLabel)}</div>` : ''}
       </div>
     </div>
-    <div class="flex items-center gap-2.5 flex-shrink-0">
+    <div class="flex items-center gap-2 flex-shrink-0">
       <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="-1"
         class="w-11 h-11 rounded-full bg-[#16241b] border border-[#243527] text-xl font-display font-700 text-[#eef3ee] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">−</button>
-      <div class="w-9 text-center font-display font-700 text-2xl text-[#eef3ee]">${display}</div>
+      <div class="w-8 text-center font-display font-700 text-2xl text-[#eef3ee]">${display}</div>
+      <button ${locked?'disabled':''} data-action="score-set-par" ${dataAttrs} title="Set to Par (${par})"
+        class="h-11 px-2.5 rounded-lg bg-[#16241b] border border-[#3fae6a] text-[10px] font-display font-700 tracking-wide text-[#7be6a4] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">PAR</button>
       <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="1"
         class="w-11 h-11 rounded-full bg-[#3fae6a] text-[#0a100c] text-xl font-display font-700 flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">+</button>
     </div>
@@ -884,13 +1290,70 @@ function sectionLabel(text, color){
 }
 
 /* ---------------------------------------------------------
+   Wager display + Press action — shared across hole cards
+   --------------------------------------------------------- */
+function activeWagersForPairing(sessionId, pairingId){
+  return STATE.wagers.filter(w => w.sessionId===sessionId && w.matchId===pairingId && (w.status===WAGER_STATUS.ACCEPTED || w.status===WAGER_STATUS.OPEN));
+}
+
+function wagerLineText(w){
+  if(w.wagerType===WAGER_TYPE.MATCH_SEGMENT){
+    const pickTeam = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
+    const pendingTag = w.status===WAGER_STATUS.OPEN ? ' · awaiting accept' : '';
+    return `💵 ${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))} — ${fmtMoney(w.amount)} on ${escapeHtml(pickTeam)} (${segLabel(w.sessionId, segFromEnum(w.segment))})${pendingTag}`;
+  }
+  if(w.wagerType===WAGER_TYPE.PRESS){
+    const team = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
+    return `🎲 Press by ${escapeHtml(team)} — ${fmtMoney(w.amount)} (${w.segment})`;
+  }
+  return '';
+}
+
+function activeWagersStrip(sessionId, pairingId){
+  const list = activeWagersForPairing(sessionId, pairingId);
+  if(list.length===0) return '';
+  return `<div class="mx-4 mt-3 space-y-1.5">${list.map(w=>`
+    <div class="rounded-lg border border-[#3a2f12] bg-[#1a1408] px-3 py-2 text-[11px] text-[#f2d17f] font-medium">${wagerLineText(w)}</div>
+  `).join('')}</div>`;
+}
+
+// Trailing side can Press once down 2+ within the segment containing the current hole (Overall excluded — press is a "within the nine" bet).
+function pressEligibility(sessionId, pairingId, segments, curHole){
+  const segKey = sessionId==='m3' ? (curHole<5 ? 'front9':'back9') : (curHole<9 ? 'front9':'back9');
+  const seg = segments[segIndex(segKey)];
+  if(seg.final.finished) return null;
+  const pressingSide = seg.currentDiff>=2 ? 'blue' : (seg.currentDiff<=-2 ? 'red' : null);
+  if(!pressingSide) return null;
+  const dup = STATE.wagers.some(w => w.wagerType===WAGER_TYPE.PRESS && w.sessionId===sessionId && w.matchId===pairingId && w.parentSegment===segKey && w.status===WAGER_STATUS.ACCEPTED);
+  if(dup) return null;
+  return { segKey, pressingSide };
+}
+
+function pressButton(sessionId, pairingId, segments, curHole){
+  const elig = pressEligibility(sessionId, pairingId, segments, curHole);
+  if(!elig) return '';
+  const teamName = elig.pressingSide==='red' ? STATE.teamNames.red : STATE.teamNames.blue;
+  const amt = STATE.purseConfig.defaultPressAmount || 20;
+  return `
+  <div class="mx-4 mt-3">
+    <button data-action="initiate-press" data-match="${sessionId}" data-pairing="${pairingId}" data-segment="${elig.segKey}" data-hole="${curHole}" data-side="${elig.pressingSide}"
+      class="w-full text-xs font-semibold py-2.5 rounded-xl border active:scale-95 transition"
+      style="background:rgba(217,178,92,0.12); border-color:#7d6a2f; color:#f2d17f;">
+      🎲 ${escapeHtml(teamName)} is down 2 — Press for ${fmtMoney(amt)}?
+    </button>
+  </div>`;
+}
+
+/* ---------------------------------------------------------
    Format-specific hole cards
    --------------------------------------------------------- */
 function renderBetterBallHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const locked = finished && !STATE.admin.enabled;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -906,7 +1369,9 @@ function renderBetterBallHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
+  ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3">
     ${sectionLabel(STATE.teamNames.red, RED)}
     <div class="space-y-2">
@@ -919,6 +1384,7 @@ function renderBetterBallHoleCard(matchId, pairingId){
       ${counterRow(displayName(bluePlayers[1]), null, h.raw.b2, h.par, sB2, attrs('b2'), locked, BLUE)}
     </div>
   </div>
+  ${pressButton(matchId, pairingId, segments, curHole)}
   ${holeResultStrip(h)}
   ${holeDotStrip(matchId, holesDetail, curHole)}
   <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. Each match awards up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).</p>`;
@@ -928,7 +1394,10 @@ function renderPinehurstHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { holesDetail, segments, courseHcps } = evalr;
   const finished = segments[2].final.finished;
-  const locked = finished && !STATE.admin.enabled;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -941,7 +1410,9 @@ function renderPinehurstHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
+  ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
     <span>9-Hole Team Course Handicap — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
     <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
@@ -950,6 +1421,7 @@ function renderPinehurstHoleCard(matchId, pairingId){
     ${counterRow(STATE.teamNames.red, 'Alternate-shot team score', h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
     ${counterRow(STATE.teamNames.blue, 'Alternate-shot team score', h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
   </div>
+  ${pressButton(matchId, pairingId, segments, curHole)}
   ${holeResultStrip(h)}
   ${holeDotStrip(matchId, holesDetail, curHole)}
   <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: each player's 9-hole Course Handicap ≈ (Index × Slope/113 + Rating − Par) ÷ 2, then the pair's two 9-hole handicaps are combined ÷ 2 for one team number. Points: Holes 1–5 (1.0) + Holes 6–9 (1.0) + Overall (1.0).</p>`;
@@ -958,8 +1430,10 @@ function renderPinehurstHoleCard(matchId, pairingId){
 function renderSinglesHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const locked = finished && !STATE.admin.enabled;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -973,11 +1447,14 @@ function renderSinglesHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
+  ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3 space-y-2">
     ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
     ${counterRow(displayName(bp), bp.name, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
   </div>
+  ${pressButton(matchId, pairingId, segments, curHole)}
   ${holeResultStrip(h)}
   ${holeDotStrip(matchId, holesDetail, curHole)}
   <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. Points: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0) — up to 3.0 pts per singles match.</p>`;
@@ -1034,14 +1511,23 @@ function renderRosterSection(){
       </div>
       <div class="space-y-1.5">
         ${players.map(p => `
-          <div class="flex items-center gap-1 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5">
-            <input value="${escapeAttr(p.nickname||'')}" placeholder="Nickname" data-field="pnick" data-side="${sideKey}" data-player="${p.id}"
-              class="team-field w-16 flex-shrink-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-xs font-display font-600 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
-            <input value="${escapeAttr(p.name)}" data-field="pname" data-side="${sideKey}" data-player="${p.id}"
-              class="team-field flex-1 min-w-0 bg-transparent text-xs focus:outline-none" />
-            <input type="number" step="0.1" value="${p.hcp}" data-field="phcp" data-side="${sideKey}" data-player="${p.id}" title="Handicap Index"
-              class="team-field w-12 text-center bg-[#101a14] border border-[#243527] rounded text-xs py-0.5 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
-            <button data-action="remove-player" data-side="${sideKey}" data-player="${p.id}" ${totalCount<=8?'disabled':''} class="text-[#e2696f] text-xs px-1 disabled:opacity-20 disabled:cursor-not-allowed">✕</button>
+          <div class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 space-y-1">
+            <div class="flex items-center gap-1">
+              <input value="${escapeAttr(p.nickname||'')}" placeholder="Nickname" data-field="pnick" data-side="${sideKey}" data-player="${p.id}"
+                class="team-field w-16 flex-shrink-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-xs font-display font-600 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+              <input value="${escapeAttr(p.name)}" data-field="pname" data-side="${sideKey}" data-player="${p.id}"
+                class="team-field flex-1 min-w-0 bg-transparent text-xs focus:outline-none" />
+              <input type="number" step="0.1" value="${p.hcp}" data-field="phcp" data-side="${sideKey}" data-player="${p.id}" title="Handicap Index"
+                class="team-field w-12 text-center bg-[#101a14] border border-[#243527] rounded text-xs py-0.5 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+              <button data-action="remove-player" data-side="${sideKey}" data-player="${p.id}" ${totalCount<=8?'disabled':''} class="text-[#e2696f] text-xs px-1 disabled:opacity-20 disabled:cursor-not-allowed">✕</button>
+            </div>
+            <div class="flex items-center gap-1">
+              <input value="${escapeAttr(p.venmo||'')}" placeholder="@venmo-handle" data-field="pvenmo" data-side="${sideKey}" data-player="${p.id}"
+                class="team-field flex-1 min-w-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-[10px] focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+              <input value="${escapeAttr(p.zelle||'')}" placeholder="Zelle phone/email" data-field="pzelle" data-side="${sideKey}" data-player="${p.id}"
+                class="team-field flex-1 min-w-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-[10px] focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+              <span class="text-[10px] font-display font-600 flex-shrink-0 ${p.wagerBalance>0?'text-[#7be6a4]':p.wagerBalance<0?'text-[#f2a1ab]':'text-[#7f9689]'}" title="Net wager win/loss so far">${fmtMoney(p.wagerBalance||0)}</span>
+            </div>
           </div>
         `).join('')}
       </div>
@@ -1052,7 +1538,7 @@ function renderRosterSection(){
   return `
   <div class="px-4 pt-4">
     <h2 class="font-display font-700 text-lg">Roster</h2>
-    <p class="text-xs text-[#7f9689]">${totalCount} players total (8–20 supported) ${balanced ? '· sides balanced ✅' : '· sides uneven ⚠️'}. Nicknames show on scorecards and pairings; the Index number drives Course Handicap on every match.</p>
+    <p class="text-xs text-[#7f9689]">${totalCount} players total (8–20 supported) ${balanced ? '· sides balanced ✅' : '· sides uneven ⚠️'}. Nicknames show on scorecards; Venmo/Zelle contacts power the Settlement tab's payout links; the small $ figure is each player's running wager net.</p>
   </div>
   <div class="mx-4 mt-3 flex gap-3">
     ${side('red', RED, 'Red')}
@@ -1208,6 +1694,8 @@ function renderCloudSyncSection(){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#123a22] border border-[#2f7d4f] text-[#7be6a4]">☁ Connected${sourceNote} — live sync active</span>`;
   } else if(cloudStatus==='connecting'){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a2f12] border border-[#7d6a2f] text-[#f2d17f]">Connecting…</span>`;
+  } else if(cloudStatus==='offline-queued'){
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a2f12] border border-[#7d6a2f] text-[#f2d17f]">📴 Offline — your changes are saved locally and will sync automatically once signal returns</span>`;
   } else if(cloudStatus==='error'){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a1220] border border-[#7d2f3a] text-[#f2a1ab]">⚠ ${escapeHtml(cloudError||'Connection failed')}</span>`;
   } else {
@@ -1258,13 +1746,358 @@ alter publication supabase_realtime add table turtle_cup_state;</pre>
   </details>`;
 }
 
+function renderPurseSection(){
+  const cfg = STATE.purseConfig;
+  const totalPlayers = STATE.roster.red.length + STATE.roster.blue.length;
+  const totalPurse = round2(cfg.buyInPerPlayer * totalPlayers);
+  const pctSum = cfg.winningTeamPct + cfg.medalistPct + cfg.trophyPoolPct;
+  const fieldCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
+
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">💵 Tournament Purse &amp; Buy-In</h2>
+    <p class="text-xs text-[#7f9689]">Every player's buy-in funds the purse, which pays out across three pools based on final results. This combines with side-wager wins/losses at Settlement.</p>
+  </div>
+  <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="grid grid-cols-2 gap-2.5">
+      <label class="text-[11px] text-[#7f9689]">Per-Player Buy-In
+        <input type="number" min="0" step="5" value="${cfg.buyInPerPlayer}" data-action="purse-field" data-field="buyInPerPlayer" class="${fieldCls} mt-1" />
+      </label>
+      <div class="text-[11px] text-[#7f9689]">Total Purse <span class="text-[9px]">(${totalPlayers} players)</span>
+        <div class="mt-1 bg-[#101a14] border border-[#243527] rounded-lg px-2.5 py-2 font-display font-700 text-sm text-[#d9b25c]">${fmtMoney(totalPurse)}</div>
+      </div>
+    </div>
+    <div class="h-px bg-[#1f2f26] my-3"></div>
+    <div class="text-[10px] uppercase tracking-wide text-[#9db3a4] font-semibold mb-2">Purse Allocation ${pctSum!==100 ? `<span class="text-[#f2a1ab] normal-case font-normal">— totals ${pctSum}%, not 100%</span>` : `<span class="text-[#7be6a4] normal-case font-normal">— totals 100% ✅</span>`}</div>
+    <div class="grid grid-cols-3 gap-2">
+      <label class="text-[10px] text-[#7f9689]">Winning Team %
+        <input type="number" min="0" max="100" value="${cfg.winningTeamPct}" data-action="purse-field" data-field="winningTeamPct" class="${fieldCls} mt-1" />
+      </label>
+      <label class="text-[10px] text-[#7f9689]">Medalist %
+        <input type="number" min="0" max="100" value="${cfg.medalistPct}" data-action="purse-field" data-field="medalistPct" class="${fieldCls} mt-1" />
+      </label>
+      <label class="text-[10px] text-[#7f9689]">Trophy Pool %
+        <input type="number" min="0" max="100" value="${cfg.trophyPoolPct}" data-action="purse-field" data-field="trophyPoolPct" class="${fieldCls} mt-1" />
+      </label>
+    </div>
+    <p class="text-[10px] text-[#66786b] mt-2">Winning Team pool splits evenly among the players on the side ahead in the Team Standings. Medalist pool goes to the tournament-wide Low Net Medalist. Trophy Pool goes to the tournament-wide Birdie King. Any pool with no clear individual leader yet splits evenly across everyone as a live placeholder.</p>
+    <div class="h-px bg-[#1f2f26] my-3"></div>
+    <label class="text-[11px] text-[#7f9689] block">Default Press Stake
+      <input type="number" min="1" step="5" value="${cfg.defaultPressAmount}" data-action="purse-field" data-field="defaultPressAmount" class="${fieldCls} mt-1 max-w-[140px]" />
+    </label>
+  </div>`;
+}
+
+/* =========================================================
+   WAGER CENTRAL — propose / accept / decline / settle ($ USD)
+   ========================================================= */
+function allPlayersFlat(){ return [...STATE.roster.red, ...STATE.roster.blue]; }
+
+function playerOptionsHtml(selectedId, excludeId){
+  return allPlayersFlat().filter(p=>p.id!==excludeId).map(p =>
+    `<option value="${p.id}" ${p.id===selectedId?'selected':''}>${escapeHtml(displayName(p))} — ${escapeHtml(p.name)}</option>`
+  ).join('');
+}
+
+function renderWagerProposeForm(){
+  const d = STATE.ui.wagerDraft;
+  const matchOptions = Object.keys(MATCH_META).filter(mid => (STATE.lineups[mid]||[]).length>0);
+  const selectCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
+
+  const kindTabs = ['match','prop'].map(k => `
+    <button data-action="wager-kind-select" data-kind="${k}" class="flex-1 text-xs font-semibold py-2 rounded-lg border transition ${d.kind===k?'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]':'bg-[#111c15] text-[#9db3a4] border-[#243527]'}">${k==='match'?'Match Wager':'Prop Bet'}</button>
+  `).join('');
+
+  let fields = '';
+  if(d.kind==='match'){
+    const pairs = d.matchId ? (STATE.lineups[d.matchId]||[]) : [];
+    const segOptions = ['front9','back9','overall'].map(key => ({ key, label: d.matchId ? segLabel(d.matchId, key) : key }));
+    fields = `
+    <div class="space-y-2 mt-2">
+      <select data-action="wager-draft-select" data-field="matchId" class="${selectCls}">
+        <option value="">Choose match…</option>
+        ${matchOptions.map(mid=>`<option value="${mid}" ${d.matchId===mid?'selected':''}>${MATCH_META[mid].label}</option>`).join('')}
+      </select>
+      ${d.matchId ? `
+      <select data-action="wager-draft-select" data-field="pairingId" class="${selectCls}">
+        <option value="">Choose pairing…</option>
+        ${pairs.map(p=>`<option value="${p.id}" ${d.pairingId===p.id?'selected':''}>${escapeHtml(pairingLabel(d.matchId,p))}</option>`).join('')}
+      </select>` : ''}
+      ${d.matchId && d.pairingId ? `
+      <select data-action="wager-draft-select" data-field="segment" class="${selectCls}">
+        <option value="">Choose segment…</option>
+        ${segOptions.map(s=>`<option value="${s.key}" ${d.segment===s.key?'selected':''}>${s.label}</option>`).join('')}
+      </select>` : ''}
+      <div class="grid grid-cols-2 gap-2">
+        <select data-action="wager-draft-select" data-field="proposerId" class="${selectCls}">
+          <option value="">Proposer…</option>
+          ${playerOptionsHtml(d.proposerId, d.opponentId)}
+        </select>
+        <select data-action="wager-draft-select" data-field="opponentId" class="${selectCls}">
+          <option value="">Opponent…</option>
+          ${playerOptionsHtml(d.opponentId, d.proposerId)}
+        </select>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-[11px] text-[#7f9689] flex-shrink-0">Proposer picks:</span>
+        <select data-action="wager-draft-select" data-field="side" class="${selectCls}">
+          <option value="red" ${d.side==='red'?'selected':''}>${escapeHtml(STATE.teamNames.red)} wins</option>
+          <option value="blue" ${d.side==='blue'?'selected':''}>${escapeHtml(STATE.teamNames.blue)} wins</option>
+        </select>
+      </div>
+    </div>`;
+  } else {
+    const propOptions = [
+      { v:'medalist', l:'Low Net Medalist' },
+      { v:'birdieKing', l:'Birdie King' },
+      { v:'champion', l:'Team Red/Blue Champion' },
+      { v:'custom', l:'Custom Prop' },
+    ];
+    let pickFields = '';
+    if(d.propKind==='champion'){
+      pickFields = `
+      <div class="flex items-center gap-2">
+        <span class="text-[11px] text-[#7f9689] flex-shrink-0">Proposer picks:</span>
+        <select data-action="wager-draft-select" data-field="proposerPick" class="${selectCls}">
+          <option value="red" ${d.proposerPick==='red'?'selected':''}>${escapeHtml(STATE.teamNames.red)}</option>
+          <option value="blue" ${d.proposerPick==='blue'?'selected':''}>${escapeHtml(STATE.teamNames.blue)}</option>
+        </select>
+      </div>`;
+    } else if(d.propKind==='medalist' || d.propKind==='birdieKing'){
+      pickFields = `
+      <div class="grid grid-cols-2 gap-2">
+        <select data-action="wager-draft-select" data-field="proposerPick" class="${selectCls}">
+          <option value="">Proposer's pick…</option>
+          ${playerOptionsHtml(d.proposerPick, '')}
+        </select>
+        <select data-action="wager-draft-select" data-field="opponentPick" class="${selectCls}">
+          <option value="">Opponent's pick…</option>
+          ${playerOptionsHtml(d.opponentPick, '')}
+        </select>
+      </div>`;
+    } else if(d.propKind==='custom'){
+      pickFields = `<input id="wagerLabelInput" type="text" placeholder="Describe the bet (e.g. 'Ace breaks 80')" class="${selectCls}" />`;
+    }
+    fields = `
+    <div class="space-y-2 mt-2">
+      <select data-action="wager-draft-select" data-field="propKind" class="${selectCls}">
+        ${propOptions.map(o=>`<option value="${o.v}" ${d.propKind===o.v?'selected':''}>${o.l}</option>`).join('')}
+      </select>
+      ${pickFields}
+      <div class="grid grid-cols-2 gap-2">
+        <select data-action="wager-draft-select" data-field="proposerId" class="${selectCls}">
+          <option value="">Proposer…</option>
+          ${playerOptionsHtml(d.proposerId, d.opponentId)}
+        </select>
+        <select data-action="wager-draft-select" data-field="opponentId" class="${selectCls}">
+          <option value="">Opponent…</option>
+          ${playerOptionsHtml(d.opponentId, d.proposerId)}
+        </select>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="mx-4 mb-4 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="flex gap-2">${kindTabs}</div>
+    ${fields}
+    <div class="flex items-center gap-2 mt-3">
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">Stake $</span>
+      <input id="wagerAmountInput" type="number" min="1" step="5" value="10" class="w-20 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">each</span>
+      <button data-action="propose-wager" class="ml-auto text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Propose</button>
+    </div>
+  </div>`;
+}
+
+function wagerStatusPill(status){
+  const map = {
+    OPEN: 'bg-[#3a2f12] border-[#7d6a2f] text-[#f2d17f]',
+    ACCEPTED: 'bg-[#132436] border-[#2f5a7d] text-[#8fc4f2]',
+    SETTLED: 'bg-[#123a22] border-[#2f7d4f] text-[#7be6a4]',
+    PUSHED: 'bg-[#161f1a] border-[#3a3527] text-[#d9c88f]',
+    DECLINED: 'bg-[#161f1a] border-[#243527] text-[#7f9689]',
+  };
+  return `<span class="flex-shrink-0 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full border ${map[status]||map.DECLINED}">${status.toLowerCase()}</span>`;
+}
+
+function wagerCardDescription(w){
+  if(w.wagerType===WAGER_TYPE.MATCH_SEGMENT){
+    const pickTeam = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
+    const pair = (STATE.lineups[w.sessionId]||[]).find(p=>p.id===w.matchId);
+    const matchupText = pair ? pairingLabel(w.sessionId, pair) : 'Unknown pairing';
+    return `${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))} · ${MATCH_META[w.sessionId]?.label||w.sessionId} · ${escapeHtml(matchupText)} · ${segLabel(w.sessionId, segFromEnum(w.segment))} — creator picks ${escapeHtml(pickTeam)}`;
+  }
+  if(w.wagerType===WAGER_TYPE.PRESS){
+    const team = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
+    const pair = (STATE.lineups[w.sessionId]||[]).find(p=>p.id===w.matchId);
+    const matchupText = pair ? pairingLabel(w.sessionId, pair) : '';
+    return `Press by ${escapeHtml(team)} · ${MATCH_META[w.sessionId]?.label||w.sessionId} · ${escapeHtml(matchupText)} · ${w.segment}`;
+  }
+  const kindLabels = { medalist:'Low Net Medalist', birdieKing:'Birdie King', champion:'Tournament Champion', custom:'Custom Prop' };
+  if(w.propKind==='custom') return `Custom: ${escapeHtml(w.label||'')} — ${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))}`;
+  const pickName = (id) => w.propKind==='champion' ? (id==='red'?STATE.teamNames.red:STATE.teamNames.blue) : displayName(playerById(id));
+  return `${kindLabels[w.propKind]||'Prop'} — ${escapeHtml(displayName(playerById(w.creatorId)))} picks ${escapeHtml(pickName(w.creatorPick))}, ${escapeHtml(displayName(playerById(w.acceptorId)))} picks ${escapeHtml(pickName(w.acceptorPick))}`;
+}
+
+function wagerOutcomeText(w){
+  if(w.status!==WAGER_STATUS.SETTLED && w.status!==WAGER_STATUS.PUSHED) return '';
+  if(w.status===WAGER_STATUS.PUSHED) return `Push — stakes returned, no money moved.`;
+  if(w.wagerType===WAGER_TYPE.PRESS){
+    const teamName = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
+    return `${escapeHtml(teamName)} won the press.`;
+  }
+  return `${escapeHtml(displayName(playerById(w.winnerId)))} won ${fmtMoney(w.amount)}.`;
+}
+
+function renderWagerCard(w){
+  const isPending = w.status===WAGER_STATUS.OPEN;
+  const canManuallySettle = w.wagerType===WAGER_TYPE.PROP && w.status===WAGER_STATUS.ACCEPTED && adminAuthenticated;
+  return `
+  <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="flex items-start justify-between gap-2">
+      <div class="text-xs text-[#eef3ee] font-medium">${wagerCardDescription(w)}</div>
+      ${wagerStatusPill(w.status)}
+    </div>
+    <div class="text-[11px] text-[#d9b25c] font-display font-600 mt-1">${fmtMoney(w.amount)} stake</div>
+    ${(w.status===WAGER_STATUS.SETTLED || w.status===WAGER_STATUS.PUSHED) ? `<div class="text-[11px] text-[#7be6a4] mt-1">${wagerOutcomeText(w)}</div>` : ''}
+    ${isPending ? `
+    <div class="flex gap-2 mt-2">
+      <button data-action="accept-wager" data-wager="${w.wagerId}" class="flex-1 text-[11px] font-semibold py-1.5 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">✓ Accept</button>
+      <button data-action="decline-wager" data-wager="${w.wagerId}" class="flex-1 text-[11px] font-semibold py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] active:scale-95 transition">✗ Decline</button>
+    </div>` : ''}
+    ${canManuallySettle ? `
+    <div class="flex gap-2 mt-2">
+      <button data-action="settle-prop" data-wager="${w.wagerId}" data-winner="creator" class="flex-1 text-[11px] font-semibold py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(displayName(playerById(w.creatorId)))} won</button>
+      <button data-action="settle-prop" data-wager="${w.wagerId}" data-winner="acceptor" class="flex-1 text-[11px] font-semibold py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(displayName(playerById(w.acceptorId)))} won</button>
+      <button data-action="settle-prop" data-wager="${w.wagerId}" data-winner="push" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Push</button>
+    </div>` : ''}
+  </div>`;
+}
+
+function renderWagerCentralTab(){
+  const pending = STATE.wagers.filter(w=>w.status===WAGER_STATUS.OPEN);
+  const active = STATE.wagers.filter(w=>w.status===WAGER_STATUS.ACCEPTED);
+  const settled = STATE.wagers.filter(w=>w.status===WAGER_STATUS.SETTLED || w.status===WAGER_STATUS.PUSHED || w.status===WAGER_STATUS.DECLINED).slice().reverse();
+
+  return `
+  <div class="px-4 pt-4 pb-2">
+    <h2 class="font-display font-700 text-lg">🎲 Wager Central</h2>
+    <p class="text-xs text-[#7f9689]">Propose a $ side bet, accept or decline what's on the table, and watch it settle automatically as matches finish. Every dollar flows through the Settlement tab at the end.</p>
+  </div>
+  ${renderWagerProposeForm()}
+  ${pending.length ? `<h3 class="mx-4 font-display font-600 text-sm text-[#f2d17f] mb-2">⏳ Awaiting Response (${pending.length})</h3>${pending.map(renderWagerCard).join('')}` : ''}
+  ${active.length ? `<h3 class="mx-4 mt-4 font-display font-600 text-sm text-[#8fc4f2] mb-2">🔥 Active (${active.length})</h3>${active.map(renderWagerCard).join('')}` : ''}
+  ${(!pending.length && !active.length) ? `<p class="mx-4 text-sm text-[#7f9689] mb-4">No open wagers. Propose one above.</p>` : ''}
+  <details class="mx-4 mt-4 mb-8">
+    <summary class="cursor-pointer text-xs text-[#9db3a4] font-medium">Settled &amp; Declined (${settled.length}) ▾</summary>
+    <div class="mt-2">${settled.length ? settled.map(renderWagerCard).join('') : `<p class="text-[11px] text-[#66786b] py-2">Nothing settled yet.</p>`}</div>
+  </details>`;
+}
+
+/* =========================================================
+   SETTLEMENT — Final Net Balance + Who Owes Whom
+   ========================================================= */
+function payoutLinkButtons(fromPlayer, toPlayer, amount){
+  const note = `Turtle Cup settlement`;
+  const venmoApp = venmoDeepLink(toPlayer.venmo, amount, note);
+  const venmoWeb = venmoWebLink(toPlayer.venmo);
+  const zelleText = toPlayer.zelle ? `Zelle ${toPlayer.zelle}` : 'No Zelle on file';
+  return `
+  <div class="flex flex-wrap gap-2 mt-2">
+    <a href="${venmoApp}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#0074DE] text-white active:scale-95 transition">Open Venmo</a>
+    <a href="${venmoWeb}" target="_blank" rel="noopener" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Venmo profile</a>
+    <button data-action="copy-settlement" data-text="${escapeAttr(`${fmtMoney(amount)} to ${toPlayer.zelle||toPlayer.name} via Zelle`)}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(zelleText)} — Copy</button>
+  </div>`;
+}
+
+function renderSettlementTab(){
+  const { rows, purse } = computeFinalNetBalances();
+  const txns = computeSettlementTransactions(rows);
+  const rankedRows = rows.slice().sort((a,b)=>b.finalNet-a.finalNet);
+  const allMatchesDone = Object.keys(MATCH_META).every(mid => allPairingIds(mid).every(pid => {
+    const evalr = evaluateMatch(mid, pid);
+    return evalr && evalr.segments[2].final.finished;
+  }) || allPairingIds(mid).length===0);
+
+  const purseRows = [
+    { label:'Winning Team Pool', amt: purse.winningPool, note: purse.winningSide ? `→ ${purse.winningSide==='red'?STATE.teamNames.red:STATE.teamNames.blue}` : '→ tied, split evenly' },
+    { label:'Low Net Medalist Pool', amt: purse.medalistPool, note: purse.medalistId ? `→ ${escapeHtml(displayName(playerById(purse.medalistId)))}` : '→ no medalist yet, split evenly' },
+    { label:'Trophy (Birdie King) Pool', amt: purse.trophyPool, note: purse.birdieKingId ? `→ ${escapeHtml(displayName(playerById(purse.birdieKingId)))}` : '→ no birdie king yet, split evenly' },
+  ];
+
+  const balanceRows = rankedRows.map(r => {
+    const color = r.finalNet>0.005 ? 'text-[#7be6a4]' : r.finalNet<-0.005 ? 'text-[#f2a1ab]' : 'text-[#7f9689]';
+    return `
+    <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] px-3 py-2.5">
+      <div class="flex items-center justify-between">
+        <div class="font-display font-600 text-sm">${escapeHtml(displayName(r.player))}</div>
+        <div class="font-display font-700 text-base ${color}">${fmtMoney(r.finalNet)}</div>
+      </div>
+      <div class="text-[10px] text-[#7f9689] mt-1">Buy-in ${fmtMoney(-r.buyIn)} · Purse ${fmtMoney(r.purseShare)} · Wagers ${fmtMoney(r.wagerNet)}</div>
+    </div>`;
+  }).join('');
+
+  const txnCards = txns.map(t => {
+    const toPlayer = playerById(t.toId);
+    return `
+    <div class="mx-4 mb-3 rounded-xl border border-[#7d6a2f] bg-[#201a0c] p-3">
+      <div class="text-sm text-[#f5efe0]"><b>${escapeHtml(t.fromName)}</b> owes <b>${escapeHtml(t.toName)}</b> <span class="font-display font-700 text-[#d9b25c]">${fmtMoney(t.amount)}</span></div>
+      ${payoutLinkButtons(playerById(t.fromId), toPlayer, t.amount)}
+    </div>`;
+  }).join('');
+
+  return `
+  <div class="px-4 pt-4 pb-2">
+    <h2 class="font-display font-700 text-lg">🤝 Settlement</h2>
+    <p class="text-xs text-[#7f9689]">${allMatchesDone ? 'All matches complete — this is final.' : 'Live projection — updates as scores and wagers come in. Not final until every match is complete.'} Final Net = Purse Share − Buy-In + Wager Net.</p>
+  </div>
+
+  <div class="mx-4 mb-4 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="text-[10px] uppercase tracking-wide text-[#9db3a4] font-semibold mb-2">Purse Breakdown — Total ${fmtMoney(purse.totalPurse)}</div>
+    ${purseRows.map(pr=>`
+      <div class="flex items-center justify-between text-xs py-1">
+        <span class="text-[#c9d8cd]">${pr.label}</span>
+        <span class="text-[#d9b25c] font-display font-600">${fmtMoney(pr.amt)} <span class="text-[#7f9689] font-normal">${pr.note}</span></span>
+      </div>
+    `).join('')}
+  </div>
+
+  <h3 class="mx-4 font-display font-600 text-sm text-[#9db3a4] mb-2">Final Net by Player</h3>
+  ${balanceRows}
+
+  <h3 class="mx-4 mt-5 font-display font-600 text-sm text-[#f2d17f] mb-2">💸 Who Owes Whom (${txns.length} payment${txns.length===1?'':'s'})</h3>
+  ${txns.length ? txnCards : `<p class="mx-4 mb-6 text-sm text-[#7f9689]">Everyone's already settled up — no payments needed.</p>`}
+  <p class="mx-4 mb-8 text-[10px] text-[#66786b]">Minimized to the fewest possible transactions. Venmo's app deep link only opens the Venmo app on a phone that has it installed — the profile link and Zelle copy button work everywhere. Add Venmo/Zelle contacts for each player in the Admin → Roster section.</p>`;
+}
+
+
+function renderAdminSecuritySection(){
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">🔐 Admin Security</h2>
+    <p class="text-xs text-[#7f9689]">You're authenticated for this browser session only — closing the tab or tapping "Lock Admin" in the header requires the passcode again next time.</p>
+  </div>
+  <div class="mx-4 mb-5 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <label class="text-[11px] text-[#7f9689] block mb-1">Admin Passcode</label>
+    <div class="flex gap-2">
+      <input id="adminPasscodeChangeInput" type="text" inputmode="numeric" autocomplete="off" value="${escapeAttr(STATE.admin.passcode)}" maxlength="16"
+        class="flex-1 bg-[#0e1712] border border-[#24352a] rounded-lg px-3 py-2 text-sm font-display font-600 tracking-widest text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      <button data-action="save-admin-passcode" class="text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Save</button>
+    </div>
+    <p class="text-[10px] text-[#66786b] mt-2">Changing this immediately updates the passcode for every connected device — anyone already unlocked stays unlocked until they lock or close their tab.</p>
+  </div>`;
+}
+
 function renderAdminTab(){
   return `
+  ${renderAdminSecuritySection()}
   ${renderCloudSyncSection()}
+  ${renderPurseSection()}
   ${renderRosterSection()}
   ${renderCourseSection()}
   ${renderLineupSection()}
-  ${!STATE.admin.enabled ? `<p class="mx-4 mb-6 text-[11px] text-[#5c6f61]">Roster, course, and lineup edits are open to captains. Data export/import, tournament reset, and editing a finalized scorecard require Admin Mode (🔒 in the header, passcode protected).</p>` : `<div class="mx-4 mb-6"></div>`}`;
+  <div class="mx-4 mb-6"></div>`;
 }
 
 /* =========================================================
@@ -1311,7 +2144,7 @@ function computeSessionMetrics(sessionIds){
   const netTotals = {}; // playerId -> { name, color, total, holes }
   function addNet(player, color, netVal){
     if(netVal==null) return;
-    if(!netTotals[player.id]) netTotals[player.id] = { name: displayName(player), color, total: 0, holes: 0 };
+    if(!netTotals[player.id]) netTotals[player.id] = { id: player.id, name: displayName(player), color, total: 0, holes: 0 };
     netTotals[player.id].total += netVal;
     netTotals[player.id].holes += 1;
   }
@@ -1380,11 +2213,12 @@ function computeSessionMetrics(sessionIds){
       });
     }
   });
-  let birdieKing = null;
-  Object.values(birdieCounts).forEach(v => {
+  let birdieKing = null, birdieKingKey = null;
+  Object.entries(birdieCounts).forEach(([key, v]) => {
     if(v.count===0) return;
-    if(birdieKing===null || v.count > birdieKing.count) birdieKing = v;
+    if(birdieKing===null || v.count > birdieKing.count){ birdieKing = v; birdieKingKey = key; }
   });
+  if(birdieKing) birdieKing.id = birdieKingKey.startsWith('p:') ? birdieKingKey.slice(2) : null;
 
   return { pairings, medalist, dogfight, hammer, birdieKing };
 }
@@ -1526,10 +2360,93 @@ function renderRecapOverlay(){
   </div>`;
 }
 
+/* =========================================================
+   CONFIRMATION MODAL — for destructive admin actions
+   ========================================================= */
+function renderConfirmModal(){
+  const modal = STATE.ui.modal;
+  if(!modal || !modal.open) return '';
+
+  const configs = {
+    demo: {
+      icon: '🎲', title: 'Load Demo Data',
+      message: 'Are you sure? This will overwrite the live tournament data across all connected devices with randomly generated demo scores and settle any active wagers against them.',
+      confirmLabel: 'Load Demo Data', requireTyping: false, tone: 'amber',
+    },
+    'reset-scores': {
+      icon: '↺', title: 'Reset Scores Only',
+      message: `Are you sure? This will overwrite the live tournament data across all connected devices — every scorecard, wager, and each player's wager balance/win-loss record resets to zero. Rosters, lineups, courses, and the purse/buy-in setup are kept as-is.`,
+      confirmLabel: 'Reset Scores', requireTyping: false, tone: 'amber',
+    },
+    'reset-tournament': {
+      icon: '⚠', title: 'Reset Tournament',
+      message: `Are you sure? This will overwrite the live tournament data across all connected devices — rosters, lineups, courses, scores, wagers, the purse/buy-in setup, and every player's wager balance all return to baseline demo data. This cannot be undone.`,
+      confirmLabel: 'Confirm Reset', requireTyping: true, tone: 'red',
+    },
+  };
+  const cfg = configs[modal.type];
+  if(!cfg) return '';
+
+  const toneBorder = cfg.tone==='red' ? '#7d2f3a' : '#7d6a2f';
+  const toneBg = cfg.tone==='red' ? '#241012' : '#201a0c';
+  const confirmBtnClasses = cfg.tone==='red' ? 'bg-[#e2696f] text-[#1a0508]' : 'bg-[#3fae6a] text-[#0a100c]';
+
+  return `
+  <div class="fixed inset-0 z-[60] bg-black/75 flex items-center justify-center px-5 fade-in">
+    <div class="w-full max-w-sm rounded-2xl border p-5" style="background:${toneBg}; border-color:${toneBorder};">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-2xl">${cfg.icon}</span>
+        <h3 class="font-display font-700 text-base text-[#f5efe0]">${cfg.title}</h3>
+      </div>
+      <p class="text-xs text-[#d9c8a8] leading-relaxed mb-4">${cfg.message}</p>
+      ${cfg.requireTyping ? `
+      <label class="block text-[11px] text-[#f2a1ab] font-medium mb-1.5">Type <span class="font-display font-700 tracking-wide">RESET</span> to confirm:</label>
+      <input id="resetConfirmInput" type="text" autocomplete="off" spellcheck="false" placeholder="RESET"
+        class="w-full bg-[#0e1712] border border-[#7d2f3a] rounded-lg px-3 py-2 text-sm font-display font-600 tracking-widest text-center uppercase focus:outline-none focus:ring-1 focus:ring-[#e2696f] mb-4" />
+      ` : ''}
+      <div class="flex gap-2">
+        <button data-action="close-modal" class="flex-1 text-xs font-semibold py-2.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Cancel</button>
+        <button id="confirmModalBtn" data-action="confirm-modal" ${cfg.requireTyping ? 'disabled' : ''}
+          class="flex-1 text-xs font-semibold py-2.5 rounded-lg ${confirmBtnClasses} active:scale-95 transition disabled:opacity-30 disabled:cursor-not-allowed">${cfg.confirmLabel}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderAdminLoginModal(){
+  const modal = STATE.ui.modal;
+  if(!(modal && modal.open && modal.type==='admin-login')) return '';
+  return `
+  <div class="fixed inset-0 z-[60] bg-black/75 flex items-center justify-center px-5 fade-in">
+    <div class="w-full max-w-sm rounded-2xl border border-[#243527] p-5" style="background:#0f1712;">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-2xl">🔒</span>
+        <h3 class="font-display font-700 text-base text-[#f5efe0]">Admin Access Required</h3>
+      </div>
+      <p class="text-xs text-[#9db3a4] leading-relaxed mb-4">Enter Passcode to manage rosters, courses, lineups, cloud sync, purse setup, and score overrides.</p>
+      <input id="adminPasscodeInput" type="password" inputmode="numeric" autocomplete="off" placeholder="Passcode"
+        class="w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-3 py-2.5 text-sm font-display font-600 tracking-[0.3em] text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a] mb-1.5" />
+      <div id="adminPasscodeError" class="text-[11px] text-[#f2a1ab] mb-2 h-4"></div>
+      <div class="flex gap-2">
+        <button data-action="close-modal" class="flex-1 text-xs font-semibold py-2.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Cancel</button>
+        <button data-action="submit-admin-passcode" class="flex-1 text-xs font-semibold py-2.5 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Unlock</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderApp(){
+  // Safety net: a persisted/synced session could still have ui.tab==='admin' from before this
+  // device locked (or from a different device's save) — never render admin content without auth.
+  if(STATE.ui.tab==='admin' && !adminAuthenticated){
+    STATE.ui.tab = 'm1';
+  }
+
   const root = document.getElementById('root');
   let content;
   if(STATE.ui.tab==='admin') content = renderAdminTab();
+  else if(STATE.ui.tab==='wagers') content = renderWagerCentralTab();
+  else if(STATE.ui.tab==='settlement') content = renderSettlementTab();
   else content = renderMatchTab(STATE.ui.tab);
 
   root.innerHTML = `
@@ -1537,6 +2454,8 @@ function renderApp(){
     ${renderNav()}
     <div class="flex-1 pb-8">${content}</div>
     ${renderRecapOverlay()}
+    ${renderConfirmModal()}
+    ${renderAdminLoginModal()}
   `;
 
   saveState();
@@ -1547,9 +2466,10 @@ function renderApp(){
    ========================================================= */
 function exportData(){
   const payload = {
-    app: 'turtle-cup-ryder', version: 2, exportedAt: new Date().toISOString(),
+    app: 'turtle-cup-ryder', version: 4, exportedAt: new Date().toISOString(),
     teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, matchCourse: STATE.matchCourse,
-    lineups: STATE.lineups, scores: STATE.scores,
+    lineups: STATE.lineups, scores: STATE.scores, admin: { passcode: STATE.admin.passcode },
+    purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' });
   const url = URL.createObjectURL(blob);
@@ -1596,7 +2516,14 @@ const root = document.getElementById('root');
 
 root.addEventListener('click', (e) => {
   const tabBtn = e.target.closest('[data-tab]');
-  if(tabBtn){ STATE.ui.tab = tabBtn.dataset.tab; renderApp(); return; }
+  if(tabBtn){
+    if(tabBtn.dataset.tab==='admin' && !adminAuthenticated){
+      STATE.ui.modal = { open:true, type:'admin-login' };
+      renderApp();
+      return;
+    }
+    STATE.ui.tab = tabBtn.dataset.tab; renderApp(); return;
+  }
 
   for(const mid of Object.keys(MATCH_META)){
     const pBtn = e.target.closest(`[data-pairing-select-${mid}]`);
@@ -1607,12 +2534,39 @@ root.addEventListener('click', (e) => {
   if(!action) return;
   const act = action.dataset.action;
 
-  if(act==='demo'){
-    fillDemoScores();
+  if(act==='open-modal'){
+    STATE.ui.modal = { open:true, type: action.dataset.modalType };
     renderApp();
 
-  } else if(act==='reset-scores'){
-    STATE.scores = buildScoresForLineups(STATE.lineups);
+  } else if(act==='close-modal'){
+    const wasAdminLogin = STATE.ui.modal.type==='admin-login';
+    STATE.ui.modal = { open:false, type:null };
+    if(wasAdminLogin && STATE.ui.tab==='admin' && !adminAuthenticated) STATE.ui.tab = 'm1';
+    renderApp();
+
+  } else if(act==='confirm-modal'){
+    const modal = STATE.ui.modal;
+    if(!modal || !modal.open) return;
+
+    if(modal.type==='demo'){
+      fillDemoScores();
+      settleAllWagers();
+
+    } else if(modal.type==='reset-scores'){
+      STATE.scores = buildScoresForLineups(STATE.lineups);
+      STATE.wagers = [];
+      STATE.transactionLedger = [];
+      [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { p.wagerBalance = 0; p.stats = baselinePlayerStats(); });
+
+    } else if(modal.type==='reset-tournament'){
+      const input = document.getElementById('resetConfirmInput');
+      if(!input || input.value.trim().toUpperCase() !== 'RESET') return; // safety net even if the button state ever got out of sync
+      localStorage.removeItem(LS_KEY);
+      STATE = defaultState();
+      recalcCounters();
+    }
+
+    STATE.ui.modal = { open:false, type:null };
     renderApp();
 
   } else if(act==='open-recap'){
@@ -1640,27 +2594,38 @@ root.addEventListener('click', (e) => {
       disconnectSupabase();
     }
 
-  } else if(act==='toggle-admin'){
-    if(STATE.admin.enabled){
-      STATE.admin.enabled = false;
+  } else if(act==='lock-admin'){
+    adminAuthenticated = false;
+    saveAdminSession(false);
+    if(STATE.ui.tab==='admin') STATE.ui.tab = 'm1';
+    renderApp();
+
+  } else if(act==='submit-admin-passcode'){
+    const input = document.getElementById('adminPasscodeInput');
+    const val = input ? input.value : '';
+    if(val === STATE.admin.passcode){
+      adminAuthenticated = true;
+      saveAdminSession(true);
+      STATE.ui.modal = { open:false, type:null };
+      STATE.ui.tab = 'admin';
       renderApp();
     } else {
-      const pass = prompt('Enter admin passcode to unlock Admin Mode:');
-      if(pass===null) return;
-      if(pass===ADMIN_PASSCODE){ STATE.admin.enabled = true; renderApp(); }
-      else alert('Incorrect passcode.');
+      const err = document.getElementById('adminPasscodeError');
+      if(err) err.textContent = 'Incorrect passcode.';
+      if(input){ input.value=''; input.focus(); }
     }
+
+  } else if(act==='save-admin-passcode'){
+    if(!adminAuthenticated) return;
+    const input = document.getElementById('adminPasscodeChangeInput');
+    const val = input ? input.value.trim() : '';
+    if(!val){ alert('Passcode cannot be empty.'); return; }
+    STATE.admin.passcode = val;
+    alert('Admin passcode updated for every connected device.');
+    renderApp();
 
   } else if(act==='export-data'){
     exportData();
-
-  } else if(act==='hard-reset'){
-    if(confirm('This permanently erases all rosters, lineups and scores and restores baseline mock data. Continue?')){
-      localStorage.removeItem(LS_KEY);
-      STATE = defaultState();
-      recalcCounters();
-      renderApp();
-    }
 
   } else if(act==='add-player'){
     const side = action.dataset.side;
@@ -1702,7 +2667,7 @@ root.addEventListener('click', (e) => {
     }
     nextPairNum++;
     STATE.lineups[mid].push(pair);
-    STATE.scores[mid][id] = { holes: emptyHoles(mid) };
+    STATE.scores[mid][id] = { holes: emptyHoles(mid), finalized: false };
     renderApp();
 
   } else if(act==='remove-pairing'){
@@ -1764,7 +2729,139 @@ root.addEventListener('click', (e) => {
     const cur = entry.holes[hole][role];
     const base = cur === '' ? par : cur;
     entry.holes[hole][role] = Math.max(1, Math.min(15, base + delta));
+    settleWagersForPairing(matchId, pairing);
     renderApp();
+
+  } else if(act==='score-set-par'){
+    if(action.disabled) return; // locked scorecard — admin mode required to override
+    const matchId = action.dataset.match;
+    const pairing = action.dataset.pairing;
+    const hole = parseInt(action.dataset.hole,10);
+    const role = action.dataset.role;
+    const par = parseInt(action.dataset.par,10) || 4;
+    STATE.scores[matchId][pairing].holes[hole][role] = par;
+    settleWagersForPairing(matchId, pairing);
+    renderApp();
+
+  } else if(act==='toggle-finalize'){
+    if(!adminAuthenticated) return;
+    const matchId = action.dataset.match;
+    const pairing = action.dataset.pairing;
+    const entry = STATE.scores[matchId][pairing];
+    entry.finalized = !entry.finalized;
+    settleWagersForPairing(matchId, pairing);
+    renderApp();
+
+  } else if(act==='initiate-press'){
+    const sessionId = action.dataset.match, pairingId = action.dataset.pairing;
+    const parentSegment = action.dataset.segment, startHole = parseInt(action.dataset.hole,10);
+    const pressingSide = action.dataset.side;
+    STATE.wagers.push({
+      wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PRESS, status:WAGER_STATUS.ACCEPTED, createdAt:Date.now(),
+      sessionId, matchId:pairingId, segment: pressSegmentLabel(sessionId, parentSegment, startHole),
+      creatorId:null, acceptorId:null, targetTeam: pressingSide.toUpperCase(),
+      amount: STATE.purseConfig.defaultPressAmount || 20, winnerId:null, settledAt:null,
+      parentSegment, startHoleIndex:startHole, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+    });
+    renderApp();
+
+  } else if(act==='wager-kind-select'){
+    STATE.ui.wagerDraft.kind = action.dataset.kind;
+    renderApp();
+
+  } else if(act==='propose-wager'){
+    const d = STATE.ui.wagerDraft;
+    const amountEl = document.getElementById('wagerAmountInput');
+    const amount = Math.max(1, round2(parseFloat(amountEl ? amountEl.value : '10') || 10));
+    if(!d.proposerId || !d.opponentId){ alert('Choose a proposer and an opponent.'); return; }
+    if(d.proposerId === d.opponentId){ alert('Proposer and opponent must be different players.'); return; }
+
+    if(d.kind==='match'){
+      if(!d.matchId || !d.pairingId || !d.segment){ alert('Choose a match, pairing, and segment.'); return; }
+      STATE.wagers.push({
+        wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.MATCH_SEGMENT, status:WAGER_STATUS.OPEN, createdAt:Date.now(),
+        sessionId:d.matchId, matchId:d.pairingId, segment:segToEnum(d.segment),
+        creatorId:d.proposerId, acceptorId:d.opponentId, targetTeam:d.side.toUpperCase(), amount,
+        winnerId:null, settledAt:null, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+      });
+      STATE.ui.wagerDraft = { ...d, matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'' };
+    } else {
+      let label = '';
+      if(d.propKind==='custom'){
+        const labelEl = document.getElementById('wagerLabelInput');
+        label = labelEl ? labelEl.value.trim() : '';
+        if(!label){ alert('Describe the custom prop bet.'); return; }
+      } else if(d.propKind!=='champion' && (!d.proposerPick || !d.opponentPick)){
+        alert('Both players need to make a pick.'); return;
+      }
+      STATE.wagers.push({
+        wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PROP,
+        status:WAGER_STATUS.OPEN, createdAt:Date.now(), sessionId:null, matchId:null, segment:null,
+        creatorId:d.proposerId, acceptorId:d.opponentId,
+        amount, winnerId:null, settledAt:null,
+        propKind: d.propKind, label,
+        creatorPick: d.propKind==='champion' ? (d.proposerPick||'red') : d.proposerPick,
+        acceptorPick: d.propKind==='champion' ? '' : d.opponentPick,
+      });
+      STATE.ui.wagerDraft = { ...d, proposerId:'', opponentId:'', proposerPick:'', opponentPick:'' };
+    }
+    renderApp();
+
+  } else if(act==='accept-wager'){
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(w && w.status===WAGER_STATUS.OPEN){ w.status=WAGER_STATUS.ACCEPTED; renderApp(); }
+
+  } else if(act==='decline-wager'){
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(w && w.status===WAGER_STATUS.OPEN){ w.status=WAGER_STATUS.DECLINED; w.settledAt=Date.now(); renderApp(); }
+
+  } else if(act==='settle-prop'){
+    if(!adminAuthenticated){ alert('Enable Admin Mode to manually settle a prop bet.'); return; }
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(!w || w.status!==WAGER_STATUS.ACCEPTED) return;
+    const winner = action.dataset.winner;
+    if(winner==='push'){
+      w.status=WAGER_STATUS.PUSHED; w.winnerId=null; w.settledAt=Date.now();
+    } else {
+      const winnerId = winner==='creator' ? w.creatorId : w.acceptorId;
+      const loserId = winner==='creator' ? w.acceptorId : w.creatorId;
+      applyWagerLedger(winnerId, w.amount, TX_TYPE.WAGER_WIN, `Won prop wager vs ${displayName(playerById(loserId))} — ${wagerCardDescription(w)}`);
+      applyWagerLedger(loserId, -w.amount, TX_TYPE.WAGER_LOSS, `Lost prop wager vs ${displayName(playerById(winnerId))} — ${wagerCardDescription(w)}`);
+      const ws=playerStats(winnerId), ls=playerStats(loserId);
+      if(ws) ws.wagersWon += 1;
+      if(ls) ls.wagersLost += 1;
+      w.status=WAGER_STATUS.SETTLED; w.winnerId=winnerId; w.settledAt=Date.now();
+    }
+    renderApp();
+
+  } else if(act==='copy-settlement'){
+    const text = action.dataset.text || '';
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(
+        () => { action.textContent = '✓ Copied'; setTimeout(()=>renderApp(), 1200); },
+        () => alert(text)
+      );
+    } else {
+      alert(text);
+    }
+  }
+});
+
+// Live-enables the "Confirm Reset" button as the admin types RESET — deliberately NOT routed
+// through the normal full-rerender 'change' handler below, since that would drop focus mid-type.
+root.addEventListener('input', (e) => {
+  if(e.target.id==='resetConfirmInput'){
+    const btn = document.getElementById('confirmModalBtn');
+    if(btn) btn.disabled = e.target.value.trim().toUpperCase() !== 'RESET';
+  }
+});
+
+// Enter submits the admin passcode without needing to tap Unlock.
+root.addEventListener('keydown', (e) => {
+  if(e.key==='Enter' && e.target.id==='adminPasscodeInput'){
+    e.preventDefault();
+    const btn = document.querySelector('[data-action="submit-admin-passcode"]');
+    if(btn) btn.click();
   }
 });
 
@@ -1783,7 +2880,31 @@ root.addEventListener('change', (e) => {
     } else if(field==='phcp'){
       const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
       if(p) p.hcp = Math.max(0, parseFloat(el.value) || 0);
+    } else if(field==='pvenmo'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.venmo = el.value.trim();
+    } else if(field==='pzelle'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.zelle = el.value.trim();
     }
+    renderApp();
+
+  } else if(e.target.matches('[data-action="purse-field"]')){
+    const el = e.target;
+    const field = el.dataset.field;
+    if(field==='buyInPerPlayer') STATE.purseConfig.buyInPerPlayer = Math.max(0, round2(parseFloat(el.value) || 0));
+    else if(field==='winningTeamPct') STATE.purseConfig.winningTeamPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
+    else if(field==='medalistPct') STATE.purseConfig.medalistPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
+    else if(field==='trophyPoolPct') STATE.purseConfig.trophyPoolPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
+    else if(field==='defaultPressAmount') STATE.purseConfig.defaultPressAmount = Math.max(1, round2(parseFloat(el.value) || 20));
+    renderApp();
+
+  } else if(e.target.matches('[data-action="wager-draft-select"]')){
+    const field = e.target.dataset.field;
+    STATE.ui.wagerDraft[field] = e.target.value;
+    if(field==='matchId'){ STATE.ui.wagerDraft.pairingId=''; STATE.ui.wagerDraft.segment=''; }
+    if(field==='pairingId'){ STATE.ui.wagerDraft.segment=''; }
+    if(field==='propKind'){ STATE.ui.wagerDraft.proposerPick=''; STATE.ui.wagerDraft.opponentPick=''; }
     renderApp();
 
   } else if(e.target.matches('[data-action="draft-select"]')){
@@ -1817,11 +2938,15 @@ root.addEventListener('change', (e) => {
         const parsed = JSON.parse(reader.result);
         if(!parsed || !parsed.roster || !parsed.lineups || !parsed.scores) throw new Error('Invalid shape');
         STATE.teamNames = parsed.teamNames || STATE.teamNames;
-        STATE.roster = parsed.roster;
+        STATE.roster = ensurePlayerMoneyFields(parsed.roster);
         STATE.courses = parsed.courses || baselineCourses();
         STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
         STATE.lineups = parsed.lineups;
-        STATE.scores = parsed.scores;
+        STATE.scores = ensureScoreEntryFields(parsed.scores);
+        STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
+        STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
+        STATE.wagers = parsed.wagers || [];
+        STATE.transactionLedger = parsed.transactionLedger || [];
         recalcCounters();
         renderApp();
         alert('Tournament data imported successfully.');
@@ -1841,6 +2966,7 @@ if(!loadState()){
   STATE = defaultState();
 }
 recalcCounters();
+adminAuthenticated = loadAdminSession();
 renderApp();
 
 const savedCloudConfig = loadSupabaseConfig();
@@ -1848,7 +2974,10 @@ if(savedCloudConfig && savedCloudConfig.url && savedCloudConfig.anonKey){
   connectSupabase(savedCloudConfig.url, savedCloudConfig.anonKey, { silent:true });
 }
 
-window.addEventListener('online', renderApp);
+window.addEventListener('online', () => {
+  renderApp();
+  if(outboxPending && supabaseClient) pushCloudState(true);
+});
 window.addEventListener('offline', renderApp);
 </script>
 </body>
