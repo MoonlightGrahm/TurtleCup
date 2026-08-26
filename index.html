@@ -167,7 +167,17 @@ function buildScoresForLineups(lineups){
   Object.keys(MATCH_META).forEach(mid => {
     scores[mid] = {};
     (lineups[mid] || []).forEach(pair => {
-      scores[mid][pair.id] = { holes: emptyHoles(mid) };
+      scores[mid][pair.id] = { holes: emptyHoles(mid), finalized: false };
+    });
+  });
+  return scores;
+}
+
+// Back-fills the `finalized` flag for scorecards saved before explicit finalization existed.
+function ensureScoreEntryFields(scores){
+  Object.keys(scores||{}).forEach(mid => {
+    Object.values(scores[mid]||{}).forEach(entry => {
+      if(typeof entry.finalized !== 'boolean') entry.finalized = false;
     });
   });
   return scores;
@@ -271,7 +281,7 @@ function loadState(){
     STATE.courses = parsed.courses;
     STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
     STATE.lineups = parsed.lineups;
-    STATE.scores = parsed.scores;
+    STATE.scores = ensureScoreEntryFields(parsed.scores);
     STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
     STATE.wagers = parsed.wagers || [];
@@ -405,7 +415,7 @@ function applyRemoteState(data){
     STATE.courses = data.courses || STATE.courses;
     STATE.matchCourse = data.matchCourse || STATE.matchCourse;
     STATE.lineups = data.lineups || STATE.lineups;
-    STATE.scores = data.scores || STATE.scores;
+    STATE.scores = ensureScoreEntryFields(data.scores || STATE.scores);
     STATE.admin = { passcode: (data.admin && data.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(data.purseConfig||{}) };
     STATE.wagers = data.wagers || [];
@@ -1143,11 +1153,38 @@ function segmentBadges(segments){
   return `<div class="mx-4 mt-3 grid grid-cols-3 gap-2 fade-in">${cells}</div>`;
 }
 
-function lockNote(locked, finished){
-  if(!finished) return '';
-  return locked
-    ? `<div class="mx-4 mt-2 text-[10px] text-[#7f9689]">🔒 Overall match decided — scorecard locked. Enable Admin Mode to override.</div>`
-    : `<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though the match is final.</div>`;
+// A scorecard is only ready to auto-lock once every relevant raw score is in — mathematically
+// clinching the Overall match early (5&4, 8&7, etc.) does NOT by itself stop score entry, so Back 9
+// points, Press wagers, and tournament-wide Low Net totals can still be completed on the holes
+// still to be played.
+function allHolesEntered(matchId, holesDetail){
+  return holesDetail.every(h => (matchId==='m1' || matchId==='m2')
+    ? (h.raw.a1!=='' && h.raw.a2!=='' && h.raw.b1!=='' && h.raw.b2!=='')
+    : (h.raw.a!=='' && h.raw.b!==''));
+}
+
+function lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized){
+  const bits = [];
+  if(overallDecided && !scorecardComplete && !manuallyFinalized){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#8fc4f2]">🏁 Overall match decided — hole entry stays open so Back 9 points, Press wagers, and Low Net totals can still be completed. An admin can finalize early to lock now.</div>`);
+  }
+  if(locked){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#7f9689]">🔒 ${manuallyFinalized ? 'Finalized by admin' : 'All holes entered'} — scorecard locked. Enable Admin Mode to override.</div>`);
+  } else if(scorecardComplete || manuallyFinalized){
+    bits.push(`<div class="mx-4 mt-2 text-[10px] text-[#f2d17f]">✏️ Admin Override active — this scorecard is editable even though it's ${manuallyFinalized ? 'finalized' : 'complete'}.</div>`);
+  }
+  return bits.join('');
+}
+
+function finalizeToggleButton(matchId, pairingId, manuallyFinalized){
+  if(!adminAuthenticated) return '';
+  return `
+  <div class="mx-4 mt-2">
+    <button data-action="toggle-finalize" data-match="${matchId}" data-pairing="${pairingId}"
+      class="w-full text-[11px] font-semibold py-2 rounded-lg border active:scale-95 transition ${manuallyFinalized ? 'bg-[#2a1418] border-[#7d2f3a] text-[#f2a1ab]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a]'}">
+      ${manuallyFinalized ? '↺ Reopen Scorecard' : '🏁 Finalize Scorecard Now (match conceded — skip remaining holes)'}
+    </button>
+  </div>`;
 }
 
 /* ---------------------------------------------------------
@@ -1313,8 +1350,10 @@ function pressButton(sessionId, pairingId, segments, curHole){
 function renderBetterBallHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const locked = finished && !adminAuthenticated;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -1330,7 +1369,8 @@ function renderBetterBallHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
   ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3">
     ${sectionLabel(STATE.teamNames.red, RED)}
@@ -1354,7 +1394,10 @@ function renderPinehurstHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { holesDetail, segments, courseHcps } = evalr;
   const finished = segments[2].final.finished;
-  const locked = finished && !adminAuthenticated;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -1367,7 +1410,8 @@ function renderPinehurstHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
   ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
     <span>9-Hole Team Course Handicap — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
@@ -1386,8 +1430,10 @@ function renderPinehurstHoleCard(matchId, pairingId){
 function renderSinglesHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
   const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const locked = finished && !adminAuthenticated;
+  const overallDecided = segments[2].final.finished;
+  const scorecardComplete = allHolesEntered(matchId, holesDetail);
+  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
+  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
@@ -1401,7 +1447,8 @@ function renderSinglesHoleCard(matchId, pairingId){
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
-  ${lockNote(locked, finished)}
+  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
+  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
   ${activeWagersStrip(matchId, pairingId)}
   <div class="mx-4 mt-3 space-y-2">
     ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
@@ -2620,7 +2667,7 @@ root.addEventListener('click', (e) => {
     }
     nextPairNum++;
     STATE.lineups[mid].push(pair);
-    STATE.scores[mid][id] = { holes: emptyHoles(mid) };
+    STATE.scores[mid][id] = { holes: emptyHoles(mid), finalized: false };
     renderApp();
 
   } else if(act==='remove-pairing'){
@@ -2693,6 +2740,15 @@ root.addEventListener('click', (e) => {
     const role = action.dataset.role;
     const par = parseInt(action.dataset.par,10) || 4;
     STATE.scores[matchId][pairing].holes[hole][role] = par;
+    settleWagersForPairing(matchId, pairing);
+    renderApp();
+
+  } else if(act==='toggle-finalize'){
+    if(!adminAuthenticated) return;
+    const matchId = action.dataset.match;
+    const pairing = action.dataset.pairing;
+    const entry = STATE.scores[matchId][pairing];
+    entry.finalized = !entry.finalized;
     settleWagersForPairing(matchId, pairing);
     renderApp();
 
@@ -2886,7 +2942,7 @@ root.addEventListener('change', (e) => {
         STATE.courses = parsed.courses || baselineCourses();
         STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
         STATE.lineups = parsed.lineups;
-        STATE.scores = parsed.scores;
+        STATE.scores = ensureScoreEntryFields(parsed.scores);
         STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
         STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
         STATE.wagers = parsed.wagers || [];
