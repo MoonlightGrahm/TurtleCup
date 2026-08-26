@@ -942,7 +942,8 @@ function renderHeader(){
       </div>
       <div class="flex gap-1.5 flex-shrink-0">
         <button data-action="open-recap" title="Launch Post-Match Recap" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#241a0c] border border-[#7d6a2f] text-[#f2d17f] hover:border-[#d9b25c] active:scale-95 transition">📺 Recap</button>
-        ${adminAuthenticated ? `<button data-action="lock-admin" title="Lock Admin Mode" class="text-[11px] px-2.5 py-1.5 rounded-lg border bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f] active:scale-95 transition">🔓 Lock Admin</button>` : ''}
+        <button data-tab="admin" title="Admin Panel" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.ui.tab==='admin' ? 'tab-active' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a]'}">${adminAuthenticated ? '🔓' : '🔐'} Admin</button>
+        ${adminAuthenticated ? `<button data-action="lock-admin" title="Lock Admin Mode" class="text-[11px] w-8 h-8 flex items-center justify-center rounded-lg border bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f] active:scale-95 transition">🔒</button>` : ''}
       </div>
     </div>
 
@@ -1002,16 +1003,15 @@ function renderAdminMaintenancePanel(){
    ========================================================= */
 function renderNav(){
   const tabs = [
-    ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label.replace('Match ','M') })),
+    ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label })),
     { id:'wagers', label:'🎲 Wagers' },
     { id:'settlement', label:'🤝 Settle' },
-    { id:'admin', label:'Admin' },
   ];
   return `
   <div class="sticky top-0 z-20 bg-[#0a100c]/95 backdrop-blur border-b border-[#1c2a20] px-3 py-2">
-    <div class="flex gap-1.5 overflow-x-auto">
+    <div class="flex flex-wrap gap-1.5">
       ${tabs.map(t => `
-        <button data-tab="${t.id}" class="flex-shrink-0 text-xs font-semibold px-3.5 py-2 rounded-lg transition whitespace-nowrap ${STATE.ui.tab===t.id ? 'tab-active' : 'tab-inactive bg-[#111c15] border border-[#1f2f26] hover:border-[#3fae6a]'}">${t.label}</button>
+        <button data-tab="${t.id}" class="text-xs font-semibold px-3.5 py-2 rounded-lg transition whitespace-nowrap ${STATE.ui.tab===t.id ? 'tab-active' : 'tab-inactive bg-[#111c15] border border-[#1f2f26] hover:border-[#3fae6a]'}">${t.label}</button>
       `).join('')}
     </div>
   </div>`;
@@ -1128,10 +1128,12 @@ function counterRow(name, subLabel, value, par, strokes, dataAttrs, locked, colo
         ${subLabel ? `<div class="text-[10px] text-[#7f9689] truncate">${escapeHtml(subLabel)}</div>` : ''}
       </div>
     </div>
-    <div class="flex items-center gap-2.5 flex-shrink-0">
+    <div class="flex items-center gap-2 flex-shrink-0">
       <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="-1"
         class="w-11 h-11 rounded-full bg-[#16241b] border border-[#243527] text-xl font-display font-700 text-[#eef3ee] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">−</button>
-      <div class="w-9 text-center font-display font-700 text-2xl text-[#eef3ee]">${display}</div>
+      <div class="w-8 text-center font-display font-700 text-2xl text-[#eef3ee]">${display}</div>
+      <button ${locked?'disabled':''} data-action="score-set-par" ${dataAttrs} title="Set to Par (${par})"
+        class="h-11 px-2.5 rounded-lg bg-[#16241b] border border-[#3fae6a] text-[10px] font-display font-700 tracking-wide text-[#7be6a4] flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">PAR</button>
       <button ${locked?'disabled':''} data-action="score-adjust" ${dataAttrs} data-delta="1"
         class="w-11 h-11 rounded-full bg-[#3fae6a] text-[#0a100c] text-xl font-display font-700 flex items-center justify-center active:scale-90 transition disabled:opacity-25 disabled:cursor-not-allowed">+</button>
     </div>
@@ -2592,6 +2594,17 @@ root.addEventListener('click', (e) => {
     const cur = entry.holes[hole][role];
     const base = cur === '' ? par : cur;
     entry.holes[hole][role] = Math.max(1, Math.min(15, base + delta));
+    settleWagersForPairing(matchId, pairing);
+    renderApp();
+
+  } else if(act==='score-set-par'){
+    if(action.disabled) return; // locked scorecard — admin mode required to override
+    const matchId = action.dataset.match;
+    const pairing = action.dataset.pairing;
+    const hole = parseInt(action.dataset.hole,10);
+    const role = action.dataset.role;
+    const par = parseInt(action.dataset.par,10) || 4;
+    STATE.scores[matchId][pairing].holes[hole][role] = par;
     settleWagersForPairing(matchId, pairing);
     renderApp();
 
