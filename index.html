@@ -347,8 +347,57 @@ function cloudPayloadFromState(){
   };
 }
 
+// Some preview/sandbox iframes (and a few browser extensions) wrap fetch and try to relay the raw
+// Response — including its non-cloneable Headers object — to a parent frame via postMessage for
+// logging. That relay throws a DataCloneError that has nothing to do with whether the actual
+// Supabase request succeeded, so we detect and ignore it rather than surfacing a false failure.
+function isSpuriousCloneError(e){
+  if(!e) return false;
+  const msg = e.message || String(e);
+  return e.name==='DataCloneError' || /could not be cloned/i.test(msg) || (/postMessage/i.test(msg) && /Headers/i.test(msg));
+}
+
+// True from the moment a local mutation is made until our own push of it has been confirmed
+// by Supabase. While true, incoming realtime payloads are NOT applied — our own in-flight write
+// represents the true latest state and will supersede whatever's still live in the row. This is
+// what stops "I tapped +1 and it flickered back" — without it, a remote snapshot captured before
+// our tap can land mid-flight and visibly revert the button the user just pressed.
+let pendingLocalChange = false;
+// Set when a push fails for a real reason (offline/low-signal) rather than success — the *state
+// itself* is the outbox here (we always push the latest full snapshot), so "queueing" just means
+// "keep retrying until it lands" rather than buffering individual deltas.
+let outboxPending = false;
+let retryTimer = null;
+
+// Any realtime payload that arrives while the user has an <input>/<textarea>/<select> focused is
+// held here instead of applied immediately, so a remote update can never yank a field out from
+// under someone mid-keystroke (Supabase URL/key, wager amount, roster name, custom prop label…).
+let queuedRemoteState = null;
+
+function isUserTypingInField(){
+  const el = document.activeElement;
+  if(!el) return false;
+  const tag = el.tagName;
+  return tag==='INPUT' || tag==='TEXTAREA' || tag==='SELECT';
+}
+
+// Flush any remote update that arrived while a field had focus, the moment focus leaves it.
+document.addEventListener('focusout', () => {
+  setTimeout(() => {
+    if(queuedRemoteState && !isUserTypingInField()){
+      const data = queuedRemoteState;
+      queuedRemoteState = null;
+      applyRemoteState(data);
+    }
+  }, 50); // let focus land on whatever's next (e.g. tabbing between fields) before deciding
+}, true); // focusout only bubbles with a capturing listener
+
 function applyRemoteState(data){
   if(!data) return;
+  if(isUserTypingInField()){
+    queuedRemoteState = data; // don't rip a field out from under an active edit — apply on blur
+    return;
+  }
   applyingRemoteUpdate = true;
   try{
     STATE.teamNames = data.teamNames || STATE.teamNames;
@@ -370,24 +419,50 @@ function applyRemoteState(data){
 
 async function pushCloudState(immediate){
   if(!supabaseClient || applyingRemoteUpdate) return;
+  pendingLocalChange = true;
   const row = { id: CLOUD_ROW_ID, data: cloudPayloadFromState(), updated_at: new Date().toISOString() };
   const doPush = async () => {
     try{
       const { error } = await supabaseClient.from(CLOUD_TABLE).upsert(row);
       if(error) throw error;
       lastCloudPushAt = Date.now();
+      outboxPending = false;
+      pendingLocalChange = false;
+      clearTimeout(retryTimer);
       if(cloudStatus!=='connected'){ cloudStatus='connected'; cloudError=''; renderApp(); }
     } catch(e){
-      cloudStatus = 'error';
-      cloudError = e.message || 'Push failed';
+      if(isSpuriousCloneError(e)){
+        // The write almost certainly went through — only the browser's postMessage relay choked.
+        // Don't scare the user with a red error banner for something that isn't a sync problem.
+        console.warn('Turtle Cup: ignored a spurious DataCloneError while pushing to Supabase (likely a preview-sandbox postMessage relay, not a real failure).', e);
+        lastCloudPushAt = Date.now();
+        outboxPending = false;
+        pendingLocalChange = false;
+        if(cloudStatus!=='connected'){ cloudStatus='connected'; cloudError=''; renderApp(); }
+        return;
+      }
+      // Real failure — most likely offline or low signal. Keep the local edit exactly as the
+      // user left it (STATE already has it) and retry in the background rather than showing a
+      // scary error for a dropped bar of signal on the back nine.
+      outboxPending = true;
+      cloudStatus = navigator.onLine ? 'error' : 'offline-queued';
+      cloudError = e.message || 'Push failed — will retry automatically';
+      scheduleRetry();
       renderApp();
     }
   };
   if(immediate){ await doPush(); }
   else {
     clearTimeout(cloudSyncTimer);
-    cloudSyncTimer = setTimeout(doPush, 600); // debounce rapid taps (score +/-, etc.)
+    cloudSyncTimer = setTimeout(doPush, 500); // debounce rapid taps (score +/-, etc.)
   }
+}
+
+function scheduleRetry(){
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    if(outboxPending && supabaseClient) pushCloudState(true);
+  }, 4000);
 }
 
 function subscribeRealtime(){
@@ -396,7 +471,13 @@ function subscribeRealtime(){
   supabaseChannel = supabaseClient
     .channel('turtle-cup-live')
     .on('postgres_changes', { event:'*', schema:'public', table: CLOUD_TABLE, filter:`id=eq.${CLOUD_ROW_ID}` }, (payload) => {
-      if(payload.new && payload.new.data) applyRemoteState(payload.new.data);
+      if(!(payload.new && payload.new.data)) return;
+      if(pendingLocalChange){
+        // We have an edit not yet confirmed on the server — applying this snapshot now would
+        // visibly revert what the user just did. Our own pending push supersedes it shortly.
+        return;
+      }
+      applyRemoteState(payload.new.data);
     })
     .subscribe((status) => {
       if(status==='CHANNEL_ERROR' || status==='TIMED_OUT'){
@@ -449,6 +530,9 @@ function disconnectSupabase(){
   supabaseClient = null;
   cloudStatus = 'idle';
   cloudError = '';
+  outboxPending = false;
+  pendingLocalChange = false;
+  clearTimeout(retryTimer);
   clearSupabaseConfig();
   renderApp();
 }
@@ -912,6 +996,8 @@ function renderHeader(){
     syncLabel = '☁ Cloud Synced'; syncDot = 'bg-emerald-400'; syncText = 'text-emerald-300';
   } else if(cloudStatus==='connecting'){
     syncLabel = 'Connecting to cloud…'; syncDot = 'bg-amber-400 animate-pulse'; syncText = 'text-amber-300';
+  } else if(cloudStatus==='offline-queued'){
+    syncLabel = '📴 Offline · Changes queued'; syncDot = 'bg-amber-400 animate-pulse'; syncText = 'text-amber-300';
   } else if(cloudStatus==='error'){
     syncLabel = '⚠ Cloud error · Local only'; syncDot = 'bg-[#e2696f]'; syncText = 'text-[#f2a1ab]';
   } else {
@@ -1561,6 +1647,8 @@ function renderCloudSyncSection(){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#123a22] border border-[#2f7d4f] text-[#7be6a4]">☁ Connected${sourceNote} — live sync active</span>`;
   } else if(cloudStatus==='connecting'){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a2f12] border border-[#7d6a2f] text-[#f2d17f]">Connecting…</span>`;
+  } else if(cloudStatus==='offline-queued'){
+    statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a2f12] border border-[#7d6a2f] text-[#f2d17f]">📴 Offline — your changes are saved locally and will sync automatically once signal returns</span>`;
   } else if(cloudStatus==='error'){
     statusBadge = `<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-[#3a1220] border border-[#7d2f3a] text-[#f2a1ab]">⚠ ${escapeHtml(cloudError||'Connection failed')}</span>`;
   } else {
@@ -2830,7 +2918,10 @@ if(savedCloudConfig && savedCloudConfig.url && savedCloudConfig.anonKey){
   connectSupabase(savedCloudConfig.url, savedCloudConfig.anonKey, { silent:true });
 }
 
-window.addEventListener('online', renderApp);
+window.addEventListener('online', () => {
+  renderApp();
+  if(outboxPending && supabaseClient) pushCloudState(true);
+});
 window.addEventListener('offline', renderApp);
 </script>
 </body>
