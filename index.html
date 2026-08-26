@@ -166,7 +166,7 @@ function defaultPurseConfig(){
 function defaultState(){
   const lineups = baselineLineups();
   return {
-    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' },
+    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' }, modal:{ open:false, type:null },
       wagerDraft: { kind:'match', matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', side:'red', propKind:'medalist', proposerPick:'', opponentPick:'' } },
     admin: { enabled:false },
     teamNames: { red:'Team Red', blue:'Team Blue' },
@@ -925,8 +925,6 @@ function renderHeader(){
       </div>
       <div class="flex gap-1.5 flex-shrink-0">
         <button data-action="open-recap" title="Launch Post-Match Recap" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#241a0c] border border-[#7d6a2f] text-[#f2d17f] hover:border-[#d9b25c] active:scale-95 transition">📺 Recap</button>
-        <button data-action="demo" title="Fill demo scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Demo</button>
-        <button data-action="reset-scores" title="Clear all scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#e2696f] active:scale-95 transition">↺ Reset</button>
         <button data-action="toggle-admin" title="Admin Mode" class="text-[11px] px-2.5 py-1.5 rounded-lg border active:scale-95 transition ${STATE.admin.enabled ? 'bg-[#3a2f12] border-[#d9b25c] text-[#f2d17f]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd] hover:border-[#d9b25c]'}">${STATE.admin.enabled ? '🔓' : '🔒'}</button>
       </div>
     </div>
@@ -971,7 +969,13 @@ function renderAdminMaintenancePanel(){
         ⬆ Import Tournament Data
         <input type="file" accept="application/json" data-action="import-data" class="hidden" />
       </label>
-      <button data-action="hard-reset" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] hover:border-[#e2696f] active:scale-95 transition">⚠ Reset Tournament</button>
+    </div>
+    <div class="h-px bg-[#3a2f12] my-3"></div>
+    <div class="text-[10px] uppercase tracking-wide text-[#c9a54e] font-semibold mb-2">⚠ Destructive — affects every connected device</div>
+    <div class="flex flex-wrap gap-2">
+      <button data-action="open-modal" data-modal-type="demo" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Load Demo Data</button>
+      <button data-action="open-modal" data-modal-type="reset-scores" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#e2696f] active:scale-95 transition">↺ Reset Scores Only</button>
+      <button data-action="open-modal" data-modal-type="reset-tournament" class="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] hover:border-[#e2696f] active:scale-95 transition">⚠ Reset Tournament</button>
     </div>
   </div>`;
 }
@@ -2184,6 +2188,59 @@ function renderRecapOverlay(){
   </div>`;
 }
 
+/* =========================================================
+   CONFIRMATION MODAL — for destructive admin actions
+   ========================================================= */
+function renderConfirmModal(){
+  const modal = STATE.ui.modal;
+  if(!modal || !modal.open) return '';
+
+  const configs = {
+    demo: {
+      icon: '🎲', title: 'Load Demo Data',
+      message: 'Are you sure? This will overwrite the live tournament data across all connected devices with randomly generated demo scores and settle any active wagers against them.',
+      confirmLabel: 'Load Demo Data', requireTyping: false, tone: 'amber',
+    },
+    'reset-scores': {
+      icon: '↺', title: 'Reset Scores Only',
+      message: `Are you sure? This will overwrite the live tournament data across all connected devices — every scorecard, wager, and each player's wager balance/win-loss record resets to zero. Rosters, lineups, courses, and the purse/buy-in setup are kept as-is.`,
+      confirmLabel: 'Reset Scores', requireTyping: false, tone: 'amber',
+    },
+    'reset-tournament': {
+      icon: '⚠', title: 'Reset Tournament',
+      message: `Are you sure? This will overwrite the live tournament data across all connected devices — rosters, lineups, courses, scores, wagers, the purse/buy-in setup, and every player's wager balance all return to baseline demo data. This cannot be undone.`,
+      confirmLabel: 'Confirm Reset', requireTyping: true, tone: 'red',
+    },
+  };
+  const cfg = configs[modal.type];
+  if(!cfg) return '';
+
+  const toneBorder = cfg.tone==='red' ? '#7d2f3a' : '#7d6a2f';
+  const toneBg = cfg.tone==='red' ? '#241012' : '#201a0c';
+  const confirmBtnClasses = cfg.tone==='red' ? 'bg-[#e2696f] text-[#1a0508]' : 'bg-[#3fae6a] text-[#0a100c]';
+
+  return `
+  <div class="fixed inset-0 z-[60] bg-black/75 flex items-center justify-center px-5 fade-in">
+    <div class="w-full max-w-sm rounded-2xl border p-5" style="background:${toneBg}; border-color:${toneBorder};">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-2xl">${cfg.icon}</span>
+        <h3 class="font-display font-700 text-base text-[#f5efe0]">${cfg.title}</h3>
+      </div>
+      <p class="text-xs text-[#d9c8a8] leading-relaxed mb-4">${cfg.message}</p>
+      ${cfg.requireTyping ? `
+      <label class="block text-[11px] text-[#f2a1ab] font-medium mb-1.5">Type <span class="font-display font-700 tracking-wide">RESET</span> to confirm:</label>
+      <input id="resetConfirmInput" type="text" autocomplete="off" spellcheck="false" placeholder="RESET"
+        class="w-full bg-[#0e1712] border border-[#7d2f3a] rounded-lg px-3 py-2 text-sm font-display font-600 tracking-widest text-center uppercase focus:outline-none focus:ring-1 focus:ring-[#e2696f] mb-4" />
+      ` : ''}
+      <div class="flex gap-2">
+        <button data-action="close-modal" class="flex-1 text-xs font-semibold py-2.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Cancel</button>
+        <button id="confirmModalBtn" data-action="confirm-modal" ${cfg.requireTyping ? 'disabled' : ''}
+          class="flex-1 text-xs font-semibold py-2.5 rounded-lg ${confirmBtnClasses} active:scale-95 transition disabled:opacity-30 disabled:cursor-not-allowed">${cfg.confirmLabel}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderApp(){
   const root = document.getElementById('root');
   let content;
@@ -2197,6 +2254,7 @@ function renderApp(){
     ${renderNav()}
     <div class="flex-1 pb-8">${content}</div>
     ${renderRecapOverlay()}
+    ${renderConfirmModal()}
   `;
 
   saveState();
@@ -2268,17 +2326,37 @@ root.addEventListener('click', (e) => {
   if(!action) return;
   const act = action.dataset.action;
 
-  if(act==='demo'){
-    fillDemoScores();
-    settleAllWagers();
+  if(act==='open-modal'){
+    STATE.ui.modal = { open:true, type: action.dataset.modalType };
     renderApp();
 
-  } else if(act==='reset-scores'){
-    if(!confirm('This clears every scorecard AND resets all wager balances/history to zero. Rosters, lineups, and courses are kept. Continue?')) return;
-    STATE.scores = buildScoresForLineups(STATE.lineups);
-    STATE.wagers = [];
-    STATE.transactionLedger = [];
-    [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { p.wagerBalance = 0; p.stats = baselinePlayerStats(); });
+  } else if(act==='close-modal'){
+    STATE.ui.modal = { open:false, type:null };
+    renderApp();
+
+  } else if(act==='confirm-modal'){
+    const modal = STATE.ui.modal;
+    if(!modal || !modal.open) return;
+
+    if(modal.type==='demo'){
+      fillDemoScores();
+      settleAllWagers();
+
+    } else if(modal.type==='reset-scores'){
+      STATE.scores = buildScoresForLineups(STATE.lineups);
+      STATE.wagers = [];
+      STATE.transactionLedger = [];
+      [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { p.wagerBalance = 0; p.stats = baselinePlayerStats(); });
+
+    } else if(modal.type==='reset-tournament'){
+      const input = document.getElementById('resetConfirmInput');
+      if(!input || input.value.trim().toUpperCase() !== 'RESET') return; // safety net even if the button state ever got out of sync
+      localStorage.removeItem(LS_KEY);
+      STATE = defaultState();
+      recalcCounters();
+    }
+
+    STATE.ui.modal = { open:false, type:null };
     renderApp();
 
   } else if(act==='open-recap'){
@@ -2319,14 +2397,6 @@ root.addEventListener('click', (e) => {
 
   } else if(act==='export-data'){
     exportData();
-
-  } else if(act==='hard-reset'){
-    if(confirm('This permanently erases all rosters, lineups and scores and restores baseline mock data. Continue?')){
-      localStorage.removeItem(LS_KEY);
-      STATE = defaultState();
-      recalcCounters();
-      renderApp();
-    }
 
   } else if(act==='add-player'){
     const side = action.dataset.side;
@@ -2525,6 +2595,15 @@ root.addEventListener('click', (e) => {
     } else {
       alert(text);
     }
+  }
+});
+
+// Live-enables the "Confirm Reset" button as the admin types RESET — deliberately NOT routed
+// through the normal full-rerender 'change' handler below, since that would drop focus mid-type.
+root.addEventListener('input', (e) => {
+  if(e.target.id==='resetConfirmInput'){
+    const btn = document.getElementById('confirmModalBtn');
+    if(btn) btn.disabled = e.target.value.trim().toUpperCase() !== 'RESET';
   }
 });
 
