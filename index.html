@@ -28,6 +28,13 @@
   select{ color-scheme: dark; }
   .fade-in{ animation: fadein .18s ease-out; }
   @keyframes fadein{ from{opacity:0; transform:translateY(2px);} to{opacity:1; transform:translateY(0);} }
+  .pin-shake{ animation: pinshake .4s ease-in-out; }
+  @keyframes pinshake{
+    10%,90%{ transform:translateX(-1px); }
+    20%,80%{ transform:translateX(2px); }
+    30%,50%,70%{ transform:translateX(-4px); }
+    40%,60%{ transform:translateX(4px); }
+  }
 </style>
 </head>
 <body class="min-h-screen bg-[#0a100c] text-[#eef3ee] antialiased">
@@ -68,21 +75,115 @@ function baselineCourses(){
   ];
 }
 
-// Default per-match course assignment, matching the brief's A/B/C/D mapping
-function baselineMatchCourse(){
-  return { m1:'cA', m2:'cB', m3:'cC', m4:'cD' };
+// ---- Dynamic Tournament Schedule & Format engine -------------------------
+// Each format defines how many players line up per side, the raw-score entry shape, and — for
+// "team score" formats where the pair plays one combined ball — what % of their averaged Course
+// Handicap the team plays off of. This is a deliberately simplified stand-in for each format's real
+// USGA allowance table (which vary by club/local rules anyway), picked to keep the three team
+// formats meaningfully different from each other rather than modeling every real-world convention.
+const FORMAT_META = {
+  betterball: { label:'Better Ball (Four-Ball 2v2)',   playersPerSide:2, scoreShape:'perPlayer', teamAllowancePct:null },
+  pinehurst:  { label:'Pinehurst Alternate Shot (2v2)', playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.50 },
+  singles:    { label:'Singles (1v1)',                  playersPerSide:1, scoreShape:'perPlayer', teamAllowancePct:null },
+  altshot:    { label:'Standard Alternate Shot (2v2)',  playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.45 },
+  scramble:   { label:'Scramble (2v2)',                 playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.25 },
+};
+const FORMAT_ORDER = ['betterball','pinehurst','singles','altshot','scramble'];
+function formatMeta(formatKey){ return FORMAT_META[formatKey] || FORMAT_META.betterball; }
+
+let nextSessionNum = 1;
+
+// The tournament's original fixed 4-match schedule, now expressed as the default/migration shape
+// for the dynamic `sessions` array — old saves rebuild into exactly this on first load.
+function baselineSessions(){
+  return [
+    { sessionId:'m1', sessionName:'Match 1', date:'', timeOfDay:'AM', courseId:'cA', format:'betterball', holesToPlay:18 },
+    { sessionId:'m2', sessionName:'Match 2', date:'', timeOfDay:'AM', courseId:'cB', format:'betterball', holesToPlay:18 },
+    { sessionId:'m3', sessionName:'Match 3', date:'', timeOfDay:'PM', courseId:'cC', format:'pinehurst',  holesToPlay:9  },
+    { sessionId:'m4', sessionName:'Match 4', date:'', timeOfDay:'AM', courseId:'cD', format:'singles',    holesToPlay:18 },
+  ];
 }
 
-const MATCH_META = {
-  m1: { id:'m1', label:'Match 1', sub:'Friday · 18 Holes · Better Ball', format:'betterball' },
-  m2: { id:'m2', label:'Match 2', sub:'Saturday AM · 18 Holes · Better Ball', format:'betterball' },
-  m3: { id:'m3', label:'Match 3', sub:'Saturday PM · 9 Holes · Pinehurst', format:'pinehurst' },
-  m4: { id:'m4', label:'Match 4', sub:'Sunday · Singles Match Play', format:'singles' },
-};
+function sessionById(id){ return (STATE.sessions||[]).find(s => s.sessionId===id); }
+function sessionIds(){ return (STATE.sessions||[]).map(s => s.sessionId); }
+function sessionLabel(id){ const s = sessionById(id); return s ? s.sessionName : id; }
+
+function formatDateShort(dateStr){
+  if(!dateStr) return '';
+  const d = new Date(dateStr+'T00:00:00');
+  if(isNaN(d.getTime())) return '';
+  return d.toLocaleDateString([], { weekday:'short', month:'short', day:'numeric' });
+}
+
+// Builds the "Friday · 18 Holes · Better Ball" style subheading from a session's actual fields,
+// replacing what used to be a hardcoded string per match.
+function sessionSubLabel(session){
+  const parts = [];
+  const dateText = formatDateShort(session.date);
+  if(dateText) parts.push(dateText);
+  if(session.timeOfDay) parts.push(session.timeOfDay);
+  parts.push(`${session.holesToPlay} Holes`);
+  parts.push(formatMeta(session.format).label.split(' (')[0]);
+  return parts.join(' · ');
+}
+
+// Changing hole count changes the raw-score array shape, so any already-entered scores for this
+// session can't carry over — confirm with the admin before wiping them.
+function changeSessionHoleCount(session, newCount){
+  if(session.holesToPlay === newCount) return;
+  const pairs = STATE.lineups[session.sessionId] || [];
+  const hasScores = pairs.some(p => {
+    const entry = STATE.scores[session.sessionId] && STATE.scores[session.sessionId][p.id];
+    return entry && entry.holes.some(h => Object.values(h).some(v => v!==''));
+  });
+  if(hasScores && !confirm(`Changing ${session.sessionName} to ${newCount} holes will clear every score already entered for this session. Continue?`)) return;
+  session.holesToPlay = newCount;
+  pairs.forEach(p => {
+    STATE.scores[session.sessionId][p.id] = { holes: emptyHoles(session), finalized:false };
+  });
+}
+
+function addSession(){
+  const id = 'session'+(nextSessionNum++);
+  const session = {
+    sessionId:id, sessionName:`Match ${STATE.sessions.length+1}`, date:'', timeOfDay:'AM',
+    courseId: (STATE.courses[0]||{}).id, format:'betterball', holesToPlay:18,
+  };
+  STATE.sessions.push(session);
+  STATE.lineups[id] = [];
+  STATE.scores[id] = {};
+  STATE.ui.pairing[id] = 0;
+  STATE.ui.hole[id] = 0;
+  STATE.ui.draft[id] = { r1:'',r2:'',b1:'',b2:'' };
+  return session;
+}
+
+// Removing a session safely clears its own pairings/scores and any wagers that referenced it —
+// nothing is left pointing at a session id that no longer exists.
+function deleteSession(sessionId){
+  STATE.sessions = STATE.sessions.filter(s => s.sessionId!==sessionId);
+  delete STATE.lineups[sessionId];
+  delete STATE.scores[sessionId];
+  delete STATE.ui.pairing[sessionId];
+  delete STATE.ui.hole[sessionId];
+  delete STATE.ui.draft[sessionId];
+  STATE.wagers = STATE.wagers.filter(w => w.sessionId !== sessionId);
+  if(STATE.ui.tab===sessionId) STATE.ui.tab = sessionIds()[0] || 'wagers';
+  if(STATE.ui.recap.session===sessionId) STATE.ui.recap.session = sessionIds()[0] || 'all';
+}
+
+function moveSession(sessionId, direction){
+  const idx = STATE.sessions.findIndex(s=>s.sessionId===sessionId);
+  const swapWith = idx + direction;
+  if(idx<0 || swapWith<0 || swapWith>=STATE.sessions.length) return;
+  const tmp = STATE.sessions[idx];
+  STATE.sessions[idx] = STATE.sessions[swapWith];
+  STATE.sessions[swapWith] = tmp;
+}
 
 // ---- Real-money wager / ledger schema enums ----------------------------
 const WAGER_TYPE = { MATCH_SEGMENT:'MATCH_SEGMENT', PRESS:'PRESS', PROP:'PROP' };
-const WAGER_STATUS = { OPEN:'OPEN', ACCEPTED:'ACCEPTED', DECLINED:'DECLINED', SETTLED:'SETTLED', PUSHED:'PUSHED' };
+const WAGER_STATUS = { PENDING:'PENDING', ACTIVE:'ACTIVE', DECLINED:'DECLINED', SETTLED:'SETTLED', PUSHED:'PUSHED', VOID:'VOID' };
 const SEGMENT_ENUM = { FRONT_9:'FRONT_9', BACK_9:'BACK_9', OVERALL:'OVERALL' };
 const TX_TYPE = { WAGER_WIN:'WAGER_WIN', WAGER_LOSS:'WAGER_LOSS' };
 
@@ -116,16 +217,16 @@ function baselinePlayerStats(){ return { wagersWon: 0, wagersLost: 0 }; }
 function baselineRoster(){
   return {
     red: [
-      { id:'p1', name:'Alex Morgan', nickname:'Ace', hcp:9.4, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p2', name:'Jamie Lee', nickname:'JLee', hcp:13.1, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p3', name:'Chris Park', nickname:'Parky', hcp:6.2, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p4', name:'Sam Rivera', nickname:'Sammy', hcp:16.5, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p1', name:'Alex Morgan', nickname:'Ace', hcp:9.4, pin:'1111', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p2', name:'Jamie Lee', nickname:'JLee', hcp:13.1, pin:'2222', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p3', name:'Chris Park', nickname:'Parky', hcp:6.2, pin:'3333', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p4', name:'Sam Rivera', nickname:'Sammy', hcp:16.5, pin:'4444', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
     ],
     blue: [
-      { id:'p5', name:'Jordan Blake', nickname:'JB', hcp:11.3, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p6', name:'Taylor Kim', nickname:'TK', hcp:18.0, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p7', name:'Casey Nguyen', nickname:'CQ', hcp:8.7, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
-      { id:'p8', name:'Morgan Diaz', nickname:'Mo', hcp:20.9, wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p5', name:'Jordan Blake', nickname:'JB', hcp:11.3, pin:'5555', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p6', name:'Taylor Kim', nickname:'TK', hcp:18.0, pin:'6666', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p7', name:'Casey Nguyen', nickname:'CQ', hcp:8.7, pin:'7777', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
+      { id:'p8', name:'Morgan Diaz', nickname:'Mo', hcp:20.9, pin:'8888', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() },
     ],
   };
 }
@@ -154,20 +255,24 @@ function baselineLineups(){
   };
 }
 
-function emptyHoles(matchId){
-  const count = matchId==='m3' ? 9 : 18;
-  if(matchId==='m1' || matchId==='m2'){
+// Raw-score entry shape follows the format: 2 players/side (Better Ball) needs a1/a2/b1/b2 per hole;
+// 1 player/side (Singles) or a single team ball (Pinehurst/Alt-Shot/Scramble) both just need a/b.
+function emptyHoles(session){
+  const fmt = formatMeta(session.format);
+  const count = session.holesToPlay;
+  if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
     return Array.from({length:count}, () => ({ a1:'', a2:'', b1:'', b2:'' }));
   }
   return Array.from({length:count}, () => ({ a:'', b:'' }));
 }
 
-function buildScoresForLineups(lineups){
+function buildScoresForLineups(lineups, sessions){
   const scores = {};
-  Object.keys(MATCH_META).forEach(mid => {
-    scores[mid] = {};
-    (lineups[mid] || []).forEach(pair => {
-      scores[mid][pair.id] = { holes: emptyHoles(mid), finalized: false };
+  (sessions||[]).forEach(session => {
+    const sid = session.sessionId;
+    scores[sid] = {};
+    (lineups[sid] || []).forEach(pair => {
+      scores[sid][pair.id] = { holes: emptyHoles(session), finalized: false };
     });
   });
   return scores;
@@ -183,22 +288,65 @@ function ensureScoreEntryFields(scores){
   return scores;
 }
 
+// Wagers saved before the PIN system renamed 'OPEN'->'PENDING' and 'ACCEPTED'->'ACTIVE' — map the
+// old string values forward so nothing saved earlier silently vanishes from every status filter.
+function migrateWagerStatuses(wagers){
+  const map = { OPEN:'PENDING', ACCEPTED:'ACTIVE' };
+  (wagers||[]).forEach(w => { if(map[w.status]) w.status = map[w.status]; });
+  return wagers;
+}
+
+// Fresh saves from before the dynamic schedule engine have no `sessions` array (and courses were
+// assigned via the old flat `matchCourse` map) — rebuild the 4 fixed matches as real sessions so
+// existing lineups/scores (already keyed m1..m4) line up with zero data movement.
+function ensureSessionsField(state){
+  if(Array.isArray(state.sessions) && state.sessions.length){
+    state.sessions.forEach(s => {
+      if(typeof s.holesToPlay !== 'number') s.holesToPlay = 18;
+      if(!FORMAT_META[s.format]) s.format = 'betterball';
+      if(typeof s.sessionName !== 'string' || !s.sessionName) s.sessionName = s.sessionId;
+      if(typeof s.date !== 'string') s.date = '';
+      if(typeof s.timeOfDay !== 'string') s.timeOfDay = 'AM';
+      if(!s.courseId) s.courseId = (state.courses[0]||{}).id;
+    });
+    return state.sessions;
+  }
+  const sessions = baselineSessions();
+  if(state.matchCourse){
+    sessions.forEach(s => { if(state.matchCourse[s.sessionId]) s.courseId = state.matchCourse[s.sessionId]; });
+  }
+  return sessions;
+}
+
+function defaultUiForSessions(sessions){
+  const pairing = {}, hole = {}, draft = {};
+  sessions.forEach(s => {
+    pairing[s.sessionId] = 0;
+    hole[s.sessionId] = 0;
+    draft[s.sessionId] = formatMeta(s.format).playersPerSide===2 ? { r1:'',r2:'',b1:'',b2:'' } : { r:'',b:'' };
+  });
+  return { pairing, hole, draft };
+}
+
 function defaultPurseConfig(){
   return { buyInPerPlayer: 100, winningTeamPct: 60, medalistPct: 25, trophyPoolPct: 15, defaultPressAmount: 20 };
 }
 
 function defaultState(){
+  const sessions = baselineSessions();
   const lineups = baselineLineups();
+  const uiDefaults = defaultUiForSessions(sessions);
   return {
-    ui: { tab:'m1', pairing:{ m1:0, m2:0, m3:0, m4:0 }, hole:{ m1:0, m2:0, m3:0, m4:0 }, draft:{ m1:{r1:'',r2:'',b1:'',b2:''}, m2:{r1:'',r2:'',b1:'',b2:''}, m3:{r1:'',r2:'',b1:'',b2:''}, m4:{r:'',b:''} }, courseEditorOpen:{}, recap:{ open:false, session:'m1' }, modal:{ open:false, type:null },
+    ui: { tab:'m1', pairing:uiDefaults.pairing, hole:uiDefaults.hole, draft:uiDefaults.draft, courseEditorOpen:{}, recap:{ open:false, session:'m1' }, modal:{ open:false, type:null },
+      pinModal: { open:false, mode:null, playerId:'', context:{} },
       wagerDraft: { kind:'match', matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', side:'red', propKind:'medalist', proposerPick:'', opponentPick:'' } },
     admin: { passcode: DEFAULT_ADMIN_PASSCODE },
     teamNames: { red:'Team Red', blue:'Team Blue' },
     roster: baselineRoster(),
     courses: baselineCourses(),
-    matchCourse: baselineMatchCourse(),
+    sessions,
     lineups,
-    scores: buildScoresForLineups(lineups),
+    scores: buildScoresForLineups(lineups, sessions),
     purseConfig: defaultPurseConfig(),
     wagers: [],
     transactionLedger: [],
@@ -249,6 +397,7 @@ function ensurePlayerMoneyFields(roster){
       if(typeof p.wagerBalance !== 'number') p.wagerBalance = 0;
       if(typeof p.venmo !== 'string') p.venmo = '';
       if(typeof p.zelle !== 'string') p.zelle = '';
+      if(typeof p.pin !== 'string' || !/^\d{4}$/.test(p.pin)) p.pin = '0000';
       if(!p.stats || typeof p.stats !== 'object') p.stats = baselinePlayerStats();
       if(typeof p.stats.wagersWon !== 'number') p.stats.wagersWon = 0;
       if(typeof p.stats.wagersLost !== 'number') p.stats.wagersLost = 0;
@@ -260,7 +409,7 @@ function ensurePlayerMoneyFields(roster){
 function saveState(){
   try{
     localStorage.setItem(LS_KEY, JSON.stringify({
-      teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, matchCourse: STATE.matchCourse,
+      teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, sessions: STATE.sessions,
       lineups: STATE.lineups, scores: STATE.scores, admin: { passcode: STATE.admin.passcode },
       purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
       ui: { tab: STATE.ui.tab, pairing: STATE.ui.pairing, hole: STATE.ui.hole }, savedAt: Date.now(),
@@ -279,12 +428,12 @@ function loadState(){
     STATE.teamNames = parsed.teamNames || STATE.teamNames;
     STATE.roster = ensurePlayerMoneyFields(parsed.roster);
     STATE.courses = parsed.courses;
-    STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
+    STATE.sessions = ensureSessionsField(parsed);
     STATE.lineups = parsed.lineups;
     STATE.scores = ensureScoreEntryFields(parsed.scores);
     STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
-    STATE.wagers = parsed.wagers || [];
+    STATE.wagers = migrateWagerStatuses(parsed.wagers || []);
     STATE.transactionLedger = parsed.transactionLedger || [];
     if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
     lastSavedAt = parsed.savedAt || Date.now();
@@ -307,12 +456,27 @@ function formatClock(ts){
 // like the service_role key), so it's safe to commit and deploy as-is.
 // Leave both as '' to keep the manual "paste it in the Admin tab" flow.
 // ---------------------------------------------------------------------
-const DEFAULT_SUPABASE_URL = 'https://tjxabpammppdqoyznxae.supabase.co/';
-const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRqeGFicGFtbXBwZHFveXpueGFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NTY4OTYsImV4cCI6MjEwMzIzMjg5Nn0.vaDc-FkBn22aul1oOghw0ab-c2LyguShML0qK3sNi1Q';
+// ---------------------------------------------------------------------
+// Supabase config resolves in this order: a window-level env override (set by
+// e.g. a per-deployment <script> block or Vercel build-time injection) first,
+// falling back to these committed defaults if no override is present. The
+// anon key below is meant to be public client-side (RLS-gated, not a secret
+// like the service_role key), so it's safe to commit and deploy as-is.
+//
+// SUPABASE_TABLE and SUPABASE_CHANNEL exist specifically so different Vercel
+// Preview deployments (branches) don't cross-talk on the same realtime
+// channel/table — each branch can set its own window.ENV_SUPABASE_TABLE /
+// window.ENV_SUPABASE_CHANNEL (e.g. via a small inline <script> before this
+// one) to point at an isolated table, while still sharing the same project.
+// ---------------------------------------------------------------------
+const SUPABASE_URL = window.ENV_SUPABASE_URL || "https://tjxabpammppdqoyznxae.supabase.co/";
+const SUPABASE_ANON_KEY = window.ENV_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRqeGFicGFtbXBwZHFveXpueGFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NTY4OTYsImV4cCI6MjEwMzIzMjg5Nn0.vaDc-FkBn22aul1oOghw0ab-c2LyguShML0qK3sNi1Q";
+const SUPABASE_TABLE = window.ENV_SUPABASE_TABLE || "tournament_state";
+const SUPABASE_CHANNEL = window.ENV_SUPABASE_CHANNEL || "turtle_cup_channel";
 
 const SUPA_CONFIG_KEY = 'turtleCupSupabaseConfig_v1';
 const SUPA_OPTOUT_KEY = 'turtleCupCloudOptOut_v1';
-const CLOUD_TABLE = 'turtle_cup_state';
+const CLOUD_TABLE = SUPABASE_TABLE;
 const CLOUD_ROW_ID = 1;
 
 let supabaseClient = null;
@@ -329,8 +493,8 @@ function loadSupabaseConfig(){
     if(raw) return JSON.parse(raw);
     if(localStorage.getItem(SUPA_OPTOUT_KEY)) return null; // user explicitly disconnected — don't auto-reconnect to defaults
   } catch(e){ /* ignore */ }
-  if(DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_ANON_KEY){
-    return { url: DEFAULT_SUPABASE_URL, anonKey: DEFAULT_SUPABASE_ANON_KEY, fromDefaults: true };
+  if(SUPABASE_URL && SUPABASE_ANON_KEY){
+    return { url: SUPABASE_URL, anonKey: SUPABASE_ANON_KEY, fromDefaults: true };
   }
   return null;
 }
@@ -351,7 +515,7 @@ function clearSupabaseConfig(){
 function cloudPayloadFromState(){
   return {
     teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses,
-    matchCourse: STATE.matchCourse, lineups: STATE.lineups, scores: STATE.scores,
+    sessions: STATE.sessions, lineups: STATE.lineups, scores: STATE.scores,
     admin: { passcode: STATE.admin.passcode },
     purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
   };
@@ -379,9 +543,9 @@ let pendingLocalChange = false;
 let outboxPending = false;
 let retryTimer = null;
 
-// Any realtime payload that arrives while the user has an <input>/<textarea>/<select> focused is
-// held here instead of applied immediately, so a remote update can never yank a field out from
-// under someone mid-keystroke (Supabase URL/key, wager amount, roster name, custom prop label…).
+// Any realtime payload that arrives while the user has an <input>/<textarea>/<select> focused, OR
+// has the PIN keypad modal open, is held here instead of applied immediately — a remote update
+// must never yank a field out from under an active edit or blow away someone's in-progress PIN.
 let queuedRemoteState = null;
 
 function isUserTypingInField(){
@@ -391,21 +555,33 @@ function isUserTypingInField(){
   return tag==='INPUT' || tag==='TEXTAREA' || tag==='SELECT';
 }
 
+function isPinModalOpen(){
+  return !!(STATE.ui.pinModal && STATE.ui.pinModal.open);
+}
+
+function shouldDeferRemoteApply(){
+  return isUserTypingInField() || isPinModalOpen();
+}
+
+// Applies a remote update the moment it's safe to — called after focus leaves a field AND after
+// the PIN modal closes (success or cancel), so nothing queued silently sits forever.
+function flushQueuedRemoteStateIfPossible(){
+  if(queuedRemoteState && !shouldDeferRemoteApply()){
+    const data = queuedRemoteState;
+    queuedRemoteState = null;
+    applyRemoteState(data);
+  }
+}
+
 // Flush any remote update that arrived while a field had focus, the moment focus leaves it.
 document.addEventListener('focusout', () => {
-  setTimeout(() => {
-    if(queuedRemoteState && !isUserTypingInField()){
-      const data = queuedRemoteState;
-      queuedRemoteState = null;
-      applyRemoteState(data);
-    }
-  }, 50); // let focus land on whatever's next (e.g. tabbing between fields) before deciding
+  setTimeout(flushQueuedRemoteStateIfPossible, 50); // let focus land on whatever's next before deciding
 }, true); // focusout only bubbles with a capturing listener
 
 function applyRemoteState(data){
   if(!data) return;
-  if(isUserTypingInField()){
-    queuedRemoteState = data; // don't rip a field out from under an active edit — apply on blur
+  if(shouldDeferRemoteApply()){
+    queuedRemoteState = data; // don't interrupt an active edit or an in-progress PIN entry
     return;
   }
   applyingRemoteUpdate = true;
@@ -413,12 +589,12 @@ function applyRemoteState(data){
     STATE.teamNames = data.teamNames || STATE.teamNames;
     STATE.roster = ensurePlayerMoneyFields(data.roster || STATE.roster);
     STATE.courses = data.courses || STATE.courses;
-    STATE.matchCourse = data.matchCourse || STATE.matchCourse;
+    STATE.sessions = ensureSessionsField(data);
     STATE.lineups = data.lineups || STATE.lineups;
     STATE.scores = ensureScoreEntryFields(data.scores || STATE.scores);
     STATE.admin = { passcode: (data.admin && data.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(data.purseConfig||{}) };
-    STATE.wagers = data.wagers || [];
+    STATE.wagers = migrateWagerStatuses(data.wagers || []);
     STATE.transactionLedger = data.transactionLedger || [];
     recalcCounters();
     renderApp();
@@ -479,7 +655,7 @@ function subscribeRealtime(){
   if(!supabaseClient) return;
   if(supabaseChannel){ try{ supabaseClient.removeChannel(supabaseChannel); } catch(e){} }
   supabaseChannel = supabaseClient
-    .channel('turtle-cup-live')
+    .channel(SUPABASE_CHANNEL)
     .on('postgres_changes', { event:'*', schema:'public', table: CLOUD_TABLE, filter:`id=eq.${CLOUD_ROW_ID}` }, (payload) => {
       if(!(payload.new && payload.new.data)) return;
       if(pendingLocalChange){
@@ -565,8 +741,9 @@ function getCourse(courseId){
   return STATE.courses.find(c=>c.id===courseId) || STATE.courses[0];
 }
 
-function getCourseForMatch(matchId){
-  return getCourse(STATE.matchCourse[matchId]);
+function getCourseForMatch(sessionId){
+  const s = sessionById(sessionId);
+  return getCourse(s ? s.courseId : null);
 }
 
 function courseParTotal(course){
@@ -579,16 +756,20 @@ function courseHandicap18(index, course){
   return Math.round(index * (course.slope/113) + (course.rating - par));
 }
 
-// Match 3 plays 9 holes — approximated as half the 18-hole course handicap (no separate 9-hole rating on file).
-function courseHandicapForMatch(matchId, index, course){
+// 9-hole sessions scale the 18-hole course handicap in half (no separate 9-hole rating on file).
+function courseHandicapForSession(session, index, course){
   const ch18 = courseHandicap18(index, course);
-  return matchId==='m3' ? Math.round(ch18/2) : ch18;
+  return session.holesToPlay === 9 ? Math.round(ch18/2) : ch18;
 }
 
-function teamCourseHandicapOf(matchId, ids, course){
-  const ch1 = courseHandicapForMatch(matchId, playerById(ids[0]).hcp, course);
-  const ch2 = courseHandicapForMatch(matchId, playerById(ids[1]).hcp, course);
-  return Math.round((ch1 + ch2)/2);
+// Team-score formats (Pinehurst/Alt-Shot/Scramble) play off a single blended handicap: the two
+// players' individual Course Handicaps summed, then scaled by that format's allowance percentage.
+function teamCourseHandicapOf(session, ids, course){
+  const fmt = formatMeta(session.format);
+  const ch1 = courseHandicapForSession(session, playerById(ids[0]).hcp, course);
+  const ch2 = courseHandicapForSession(session, playerById(ids[1]).hcp, course);
+  const pct = fmt.teamAllowancePct == null ? 0.5 : fmt.teamAllowancePct;
+  return Math.round((ch1 + ch2) * pct);
 }
 
 function bestOf(x,y){
@@ -605,8 +786,9 @@ function holeWinner(a,b){
   return 'halved';
 }
 
-function holeRange(matchId){
-  return matchId === 'm3' ? { start:9, count:9 } : { start:0, count:18 };
+// 9-hole sessions default to the front nine of the assigned course.
+function holeRange(session){
+  return session.holesToPlay === 9 ? { start:0, count:9 } : { start:0, count:18 };
 }
 
 // Runs match-play logic over an ordered array of 'a'|'b'|'halved'|null hole results (used per segment)
@@ -664,13 +846,26 @@ function runningDiffs(results){
   return out;
 }
 
-// 3-point segment engine: Front9/Back9/Overall for 18H matches, Holes1-5/6-9/Overall for the 9H Pinehurst match
-function computeSegments(matchId, results){
-  const defs = matchId==='m3'
-    ? [ { label:'Holes 1–5', s:0, e:5 }, { label:'Holes 6–9', s:5, e:9 }, { label:'Overall', s:0, e:9 } ]
-    : [ { label:'Front 9', s:0, e:9 }, { label:'Back 9', s:9, e:18 }, { label:'Overall', s:0, e:18 } ];
-  return defs.map(d => ({ label:d.label, ...playMatch(results.slice(d.s, d.e)) }));
+// Segment definitions follow the session's hole count: 9-hole sessions award one 1.0-pt "Overall"
+// segment; 18-hole sessions keep the original 3-point Front 9 / Back 9 / Overall structure.
+function segmentDefsForSession(session){
+  if(session.holesToPlay === 9){
+    return [ { key:'overall', label:'Overall (9 Holes)', s:0, e:9 } ];
+  }
+  return [
+    { key:'front9', label:'Front 9', s:0, e:9 },
+    { key:'back9', label:'Back 9', s:9, e:18 },
+    { key:'overall', label:'Overall', s:0, e:18 },
+  ];
 }
+
+function computeSegments(session, results){
+  return segmentDefsForSession(session).map(d => ({ key:d.key, label:d.label, ...playMatch(results.slice(d.s, d.e)) }));
+}
+
+// The Overall segment is always last, whether there are 1 (9-hole) or 3 (18-hole) segments —
+// this is the one stable way to find it regardless of session length.
+function overallSegment(segments){ return segments[segments.length-1]; }
 
 function segmentPointTotals(segments){
   let a=0, b=0;
@@ -678,21 +873,27 @@ function segmentPointTotals(segments){
   return { a, b };
 }
 
-// Builds full per-hole detail + 3-point segments for one pairing's scorecard
-function evaluateMatch(matchId, pairingId){
-  const pair = (STATE.lineups[matchId] || []).find(p => p.id === pairingId);
+// Builds full per-hole detail + segments for one pairing's scorecard, branching on the session's
+// format (players-per-side, and whether each side enters one combined team score or per-player
+// scores) rather than a hardcoded match id.
+function evaluateMatch(sessionId, pairingId){
+  const session = sessionById(sessionId);
+  if(!session) return null;
+  const pair = (STATE.lineups[sessionId] || []).find(p => p.id === pairingId);
   if(!pair) return null;
-  const course = getCourseForMatch(matchId);
-  const { start, count } = holeRange(matchId);
-  const entry = STATE.scores[matchId][pairingId];
+  const fmt = formatMeta(session.format);
+  const course = getCourseForMatch(sessionId);
+  const { start, count } = holeRange(session);
+  const entry = STATE.scores[sessionId][pairingId];
   const holesDetail = [];
   const results = [];
+  let redPlayers, bluePlayers, courseHcps;
 
-  if(matchId==='m1' || matchId==='m2'){
+  if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
     const rp1 = playerById(pair.red[0]), rp2 = playerById(pair.red[1]);
     const bp1 = playerById(pair.blue[0]), bp2 = playerById(pair.blue[1]);
-    const chR1 = courseHandicapForMatch(matchId, rp1.hcp, course), chR2 = courseHandicapForMatch(matchId, rp2.hcp, course);
-    const chB1 = courseHandicapForMatch(matchId, bp1.hcp, course), chB2 = courseHandicapForMatch(matchId, bp2.hcp, course);
+    const chR1 = courseHandicapForSession(session, rp1.hcp, course), chR2 = courseHandicapForSession(session, rp2.hcp, course);
+    const chB1 = courseHandicapForSession(session, bp1.hcp, course), chB2 = courseHandicapForSession(session, bp2.hcp, course);
     for(let i=0;i<count;i++){
       const si = course.sis[start+i];
       const h = entry.holes[i];
@@ -705,11 +906,12 @@ function evaluateMatch(matchId, pairingId){
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, a1,a2,b1,b2, aNet, bNet, winner:w });
     }
-    var redPlayers=[rp1,rp2], bluePlayers=[bp1,bp2];
-    var courseHcps = { red:[chR1,chR2], blue:[chB1,chB2] };
-  } else if(matchId==='m3'){
-    const chRed = teamCourseHandicapOf(matchId, pair.red, course);
-    const chBlue = teamCourseHandicapOf(matchId, pair.blue, course);
+    redPlayers=[rp1,rp2]; bluePlayers=[bp1,bp2];
+    courseHcps = { red:[chR1,chR2], blue:[chB1,chB2] };
+
+  } else if(fmt.scoreShape==='teamScore'){
+    const chRed = teamCourseHandicapOf(session, pair.red, course);
+    const chBlue = teamCourseHandicapOf(session, pair.blue, course);
     for(let i=0;i<count;i++){
       const si = course.sis[start+i];
       const h = entry.holes[i];
@@ -719,12 +921,13 @@ function evaluateMatch(matchId, pairingId){
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, chRed, chBlue, aNet, bNet, winner:w });
     }
-    var redPlayers=[playerById(pair.red[0]), playerById(pair.red[1])];
-    var bluePlayers=[playerById(pair.blue[0]), playerById(pair.blue[1])];
-    var courseHcps = { red:chRed, blue:chBlue };
-  } else if(matchId==='m4'){
+    redPlayers=[playerById(pair.red[0]), playerById(pair.red[1])];
+    bluePlayers=[playerById(pair.blue[0]), playerById(pair.blue[1])];
+    courseHcps = { red:chRed, blue:chBlue };
+
+  } else { // singles: 1 player per side, perPlayer shape
     const rp = playerById(pair.red), bp = playerById(pair.blue);
-    const chR = courseHandicapForMatch(matchId, rp.hcp, course), chB = courseHandicapForMatch(matchId, bp.hcp, course);
+    const chR = courseHandicapForSession(session, rp.hcp, course), chB = courseHandicapForSession(session, bp.hcp, course);
     for(let i=0;i<count;i++){
       const si = course.sis[start+i];
       const h = entry.holes[i];
@@ -734,27 +937,29 @@ function evaluateMatch(matchId, pairingId){
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, rp, bp, aNet, bNet, winner:w });
     }
-    var redPlayers=[rp], bluePlayers=[bp];
-    var courseHcps = { red:chR, blue:chB };
+    redPlayers=[rp]; bluePlayers=[bp];
+    courseHcps = { red:chR, blue:chB };
   }
 
-  const segments = computeSegments(matchId, results);
+  const segments = computeSegments(session, results);
   const totals = segmentPointTotals(segments);
   const statusPerHole = runningDiffs(results);
 
-  return { pair, course, redPlayers, bluePlayers, holesDetail, segments, totals, statusPerHole, courseHcps };
+  return { session, format:fmt, pair, course, redPlayers, bluePlayers, holesDetail, segments, totals, statusPerHole, courseHcps };
 }
 
-function allPairingIds(matchId){
-  return (STATE.lineups[matchId] || []).map(p => p.id);
+function allPairingIds(sessionId){
+  return (STATE.lineups[sessionId] || []).map(p => p.id);
 }
 
 function computeStandings(){
   let red=0, blue=0, totalAvailable=0;
-  Object.keys(MATCH_META).forEach(mid => {
-    allPairingIds(mid).forEach(pid => {
-      totalAvailable += 3;
-      const evalr = evaluateMatch(mid, pid);
+  sessionIds().forEach(sid => {
+    const session = sessionById(sid);
+    const ptsPerMatch = session.holesToPlay === 9 ? 1 : 3;
+    allPairingIds(sid).forEach(pid => {
+      totalAvailable += ptsPerMatch;
+      const evalr = evaluateMatch(sid, pid);
       if(evalr){ red += evalr.totals.a; blue += evalr.totals.b; }
     });
   });
@@ -775,7 +980,8 @@ function escapeHtml(s){
 function escapeAttr(s){ return escapeHtml(s); }
 
 function pairingLabel(matchId, pair){
-  if(matchId==='m4'){
+  const session = sessionById(matchId);
+  if(session && formatMeta(session.format).playersPerSide===1){
     return `${displayName(playerById(pair.red))} vs ${displayName(playerById(pair.blue))}`;
   }
   const r = pair.red.map(id=>displayName(playerById(id))).join('/');
@@ -808,20 +1014,72 @@ function segLabel(matchId, segment){
   if(matchId==='m3') return segment==='front9' ? 'Holes 1–5' : 'Holes 6–9';
   return segment==='front9' ? 'Front 9' : 'Back 9';
 }
-function segIndex(segment){ return segment==='front9' ? 0 : segment==='back9' ? 1 : 2; }
+function segIndex(segment, segmentsLength){ return segment==='front9' ? 0 : segment==='back9' ? 1 : (segmentsLength||3)-1; }
 function segToEnum(segment){ return segment==='front9' ? SEGMENT_ENUM.FRONT_9 : segment==='back9' ? SEGMENT_ENUM.BACK_9 : SEGMENT_ENUM.OVERALL; }
 function segFromEnum(segEnum){ return segEnum===SEGMENT_ENUM.FRONT_9 ? 'front9' : segEnum===SEGMENT_ENUM.BACK_9 ? 'back9' : 'overall'; }
 
 // A Press's `segment` is a descriptive hole-range string (e.g. "HOLES_3-9") rather than a fixed
 // FRONT_9/BACK_9/OVERALL enum, since it always covers "the remaining holes of the parent segment".
 function pressSegmentLabel(sessionId, parentSegment, startHoleIndex){
-  const segDef = sessionId==='m3'
-    ? (parentSegment==='front9' ? {s:0,e:5} : parentSegment==='back9' ? {s:5,e:9} : {s:0,e:9})
-    : (parentSegment==='front9' ? {s:0,e:9} : parentSegment==='back9' ? {s:9,e:18} : {s:0,e:18});
-  const { start } = holeRange(sessionId);
+  const session = sessionById(sessionId);
+  const def = segmentDefsForSession(session).find(d => d.key===parentSegment) || segmentDefsForSession(session)[segmentDefsForSession(session).length-1];
+  const { start } = holeRange(session);
   const startHoleNum = start + startHoleIndex + 1;
-  const endHoleNum = start + segDef.e;
+  const endHoleNum = start + def.e;
   return `HOLES_${startHoleNum}-${endHoleNum}`;
+}
+
+// ---- PIN-gated wager creation — only called after completePinAction() confirms the right PIN ----
+function createWagerFromDraft(){
+  const d = STATE.ui.wagerDraft;
+  const amount = d._pendingAmount || 10;
+  if(d.kind==='match'){
+    STATE.wagers.push({
+      wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.MATCH_SEGMENT, status:WAGER_STATUS.PENDING, createdAt:Date.now(),
+      sessionId:d.matchId, matchId:d.pairingId, segment:segToEnum(d.segment),
+      creatorId:d.proposerId, acceptorId:d.opponentId, targetTeam:d.side.toUpperCase(), amount,
+      winnerId:null, settledAt:null, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+    });
+    STATE.ui.wagerDraft = { ...d, matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', _pendingAmount:undefined };
+  } else {
+    STATE.wagers.push({
+      wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PROP,
+      status:WAGER_STATUS.PENDING, createdAt:Date.now(), sessionId:null, matchId:null, segment:null,
+      creatorId:d.proposerId, acceptorId:d.opponentId,
+      amount, winnerId:null, settledAt:null,
+      propKind: d.propKind, label: d._pendingLabel || '',
+      creatorPick: d.propKind==='champion' ? (d.proposerPick||'red') : d.proposerPick,
+      acceptorPick: d.propKind==='champion' ? '' : d.opponentPick,
+    });
+    STATE.ui.wagerDraft = { ...d, proposerId:'', opponentId:'', proposerPick:'', opponentPick:'', _pendingAmount:undefined, _pendingLabel:undefined };
+  }
+}
+
+function createPressWager(context, initiatingPlayerId){
+  const { sessionId, pairingId, parentSegment, startHoleIndex, pressingSide } = context;
+  STATE.wagers.push({
+    wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PRESS, status:WAGER_STATUS.ACTIVE, createdAt:Date.now(),
+    sessionId, matchId:pairingId, segment: pressSegmentLabel(sessionId, parentSegment, startHoleIndex),
+    creatorId: initiatingPlayerId, acceptorId:null, targetTeam: pressingSide.toUpperCase(),
+    amount: STATE.purseConfig.defaultPressAmount || 20, winnerId:null, settledAt:null,
+    parentSegment, startHoleIndex, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+  });
+}
+
+// Dispatches on the PIN modal's `mode` once the entered PIN matches the target player's — this is
+// the single choke point where a verified PIN actually commits a wager action.
+function completePinAction(m){
+  if(m.mode==='propose'){
+    createWagerFromDraft();
+  } else if(m.mode==='accept'){
+    const w = STATE.wagers.find(x=>x.wagerId===m.context.wagerId);
+    if(w && w.status===WAGER_STATUS.PENDING) w.status = WAGER_STATUS.ACTIVE;
+  } else if(m.mode==='press'){
+    createPressWager(m.context, m.playerId);
+  }
+  resetPinModalClosed();
+  renderApp(); // single render: closes the modal, mounts the new wager, and (via saveState) pushes to Supabase
+  flushQueuedRemoteStateIfPossible();
 }
 
 function playerStats(playerId){
@@ -847,11 +1105,11 @@ function settleWagersForPairing(sessionId, pairingId){
   if(!evalr) return;
 
   STATE.wagers.forEach(w => {
-    if(w.status!==WAGER_STATUS.ACCEPTED) return;
+    if(w.status!==WAGER_STATUS.ACTIVE) return;
     if(w.sessionId!==sessionId || w.matchId!==pairingId) return;
 
     if(w.wagerType===WAGER_TYPE.MATCH_SEGMENT){
-      const seg = evalr.segments[segIndex(segFromEnum(w.segment))];
+      const seg = evalr.segments[segIndex(segFromEnum(w.segment), evalr.segments.length)];
       if(!seg.final.finished) return;
       if(seg.final.winner==='halved'){
         w.status=WAGER_STATUS.PUSHED; w.winnerId=null; w.settledAt=Date.now();
@@ -861,8 +1119,8 @@ function settleWagersForPairing(sessionId, pairingId){
       const creatorWon = w.targetTeam===winnerTeam;
       const winnerId = creatorWon ? w.creatorId : w.acceptorId;
       const loserId = creatorWon ? w.acceptorId : w.creatorId;
-      applyWagerLedger(winnerId, w.amount, TX_TYPE.WAGER_WIN, `Won ${fmtMoney(w.amount)} vs ${displayName(playerById(loserId))} — ${MATCH_META[sessionId].label} ${segLabel(sessionId, segFromEnum(w.segment))}`);
-      applyWagerLedger(loserId, -w.amount, TX_TYPE.WAGER_LOSS, `Lost ${fmtMoney(w.amount)} vs ${displayName(playerById(winnerId))} — ${MATCH_META[sessionId].label} ${segLabel(sessionId, segFromEnum(w.segment))}`);
+      applyWagerLedger(winnerId, w.amount, TX_TYPE.WAGER_WIN, `Won ${fmtMoney(w.amount)} vs ${displayName(playerById(loserId))} — ${sessionLabel(sessionId)} ${segLabel(sessionId, segFromEnum(w.segment))}`);
+      applyWagerLedger(loserId, -w.amount, TX_TYPE.WAGER_LOSS, `Lost ${fmtMoney(w.amount)} vs ${displayName(playerById(winnerId))} — ${sessionLabel(sessionId)} ${segLabel(sessionId, segFromEnum(w.segment))}`);
       const ws = playerStats(winnerId), ls = playerStats(loserId);
       if(ws) ws.wagersWon += 1;
       if(ls) ls.wagersLost += 1;
@@ -870,9 +1128,9 @@ function settleWagersForPairing(sessionId, pairingId){
 
     } else if(w.wagerType===WAGER_TYPE.PRESS){
       const parentSeg = w.parentSegment;
-      const segDef = sessionId==='m3'
-        ? (parentSeg==='front9' ? {s:0,e:5} : parentSeg==='back9' ? {s:5,e:9} : {s:0,e:9})
-        : (parentSeg==='front9' ? {s:0,e:9} : parentSeg==='back9' ? {s:9,e:18} : {s:0,e:18});
+      const defs = segmentDefsForSession(evalr.session);
+      const def = defs.find(d => d.key===parentSeg) || defs[defs.length-1];
+      const segDef = { s: def.s, e: def.e };
       const results = evalr.holesDetail.slice(segDef.s, segDef.e).map(h=>h.winner);
       const pressResults = results.slice(w.startHoleIndex - segDef.s);
       const played = playMatch(pressResults);
@@ -881,11 +1139,11 @@ function settleWagersForPairing(sessionId, pairingId){
 
       const winTeam = played.final.winner==='a' ? 'red' : 'blue';
       const loseTeam = winTeam==='red' ? 'blue' : 'red';
-      const teamPlayers = (team) => sessionId==='m4'
+      const teamPlayers = (team) => evalr.format.playersPerSide===1
         ? [team==='red'?evalr.redPlayers[0]:evalr.bluePlayers[0]]
         : (team==='red'?evalr.redPlayers:evalr.bluePlayers);
-      teamPlayers(winTeam).forEach(p => applyWagerLedger(p.id, w.amount, TX_TYPE.WAGER_WIN, `Won the Press ${fmtMoney(w.amount)} — ${MATCH_META[sessionId].label} ${w.segment}`));
-      teamPlayers(loseTeam).forEach(p => applyWagerLedger(p.id, -w.amount, TX_TYPE.WAGER_LOSS, `Lost the Press ${fmtMoney(w.amount)} — ${MATCH_META[sessionId].label} ${w.segment}`));
+      teamPlayers(winTeam).forEach(p => applyWagerLedger(p.id, w.amount, TX_TYPE.WAGER_WIN, `Won the Press ${fmtMoney(w.amount)} — ${sessionLabel(sessionId)} ${w.segment}`));
+      teamPlayers(loseTeam).forEach(p => applyWagerLedger(p.id, -w.amount, TX_TYPE.WAGER_LOSS, `Lost the Press ${fmtMoney(w.amount)} — ${sessionLabel(sessionId)} ${w.segment}`));
       teamPlayers(winTeam).forEach(p => { const s=playerStats(p.id); if(s) s.wagersWon += 1; });
       teamPlayers(loseTeam).forEach(p => { const s=playerStats(p.id); if(s) s.wagersLost += 1; });
       w.status=WAGER_STATUS.SETTLED; w.winnerId=null; w.targetTeam=winTeam.toUpperCase(); w.settledAt=Date.now();
@@ -896,7 +1154,7 @@ function settleWagersForPairing(sessionId, pairingId){
 }
 
 function settleAllWagers(){
-  Object.keys(MATCH_META).forEach(mid => {
+  sessionIds().forEach(mid => {
     allPairingIds(mid).forEach(pid => settleWagersForPairing(mid, pid));
   });
 }
@@ -928,7 +1186,7 @@ function computePursePayouts(){
     allPlayers.forEach(p => { payouts[p.id] += share; notes[p.id].push(`Standings tied — split evenly: ${fmtMoney(share)}`); });
   }
 
-  const metrics = computeSessionMetrics(Object.keys(MATCH_META));
+  const metrics = computeSessionMetrics(sessionIds());
   if(metrics.medalist && metrics.medalist.id){
     payouts[metrics.medalist.id] += medalistPool;
     notes[metrics.medalist.id].push(`Low Net Medalist pool: ${fmtMoney(medalistPool)}`);
@@ -1063,7 +1321,7 @@ function renderHeader(){
         <div class="flex-1"></div>
         <div style="width:${bluePct}%; background:${BLUE}"></div>
       </div>
-      <div class="text-[10px] text-[#5c6f61] mt-1 text-center">${st.totalAvailable.toFixed(1)} points scheduled across ${Object.keys(MATCH_META).reduce((n,m)=>n+allPairingIds(m).length,0)} matchups</div>
+      <div class="text-[10px] text-[#5c6f61] mt-1 text-center">${st.totalAvailable.toFixed(1)} points scheduled across ${sessionIds().reduce((n,m)=>n+allPairingIds(m).length,0)} matchups</div>
     </div>
 
     ${adminAuthenticated ? renderAdminMaintenancePanel() : ''}
@@ -1099,7 +1357,7 @@ function renderAdminMaintenancePanel(){
    ========================================================= */
 function renderNav(){
   const tabs = [
-    ...Object.values(MATCH_META).map(m=>({ id:m.id, label:m.label })),
+    ...STATE.sessions.map(s=>({ id:s.sessionId, label:s.sessionName })),
     { id:'wagers', label:'🎲 Wagers' },
     { id:'settlement', label:'🤝 Settle' },
   ];
@@ -1158,7 +1416,9 @@ function segmentBadges(segments){
 // points, Press wagers, and tournament-wide Low Net totals can still be completed on the holes
 // still to be played.
 function allHolesEntered(matchId, holesDetail){
-  return holesDetail.every(h => (matchId==='m1' || matchId==='m2')
+  const session = sessionById(matchId);
+  const perPlayer2 = session && formatMeta(session.format).scoreShape==='perPlayer' && formatMeta(session.format).playersPerSide===2;
+  return holesDetail.every(h => perPlayer2
     ? (h.raw.a1!=='' && h.raw.a2!=='' && h.raw.b1!=='' && h.raw.b2!=='')
     : (h.raw.a!=='' && h.raw.b!==''));
 }
@@ -1293,13 +1553,13 @@ function sectionLabel(text, color){
    Wager display + Press action — shared across hole cards
    --------------------------------------------------------- */
 function activeWagersForPairing(sessionId, pairingId){
-  return STATE.wagers.filter(w => w.sessionId===sessionId && w.matchId===pairingId && (w.status===WAGER_STATUS.ACCEPTED || w.status===WAGER_STATUS.OPEN));
+  return STATE.wagers.filter(w => w.sessionId===sessionId && w.matchId===pairingId && (w.status===WAGER_STATUS.ACTIVE || w.status===WAGER_STATUS.PENDING));
 }
 
 function wagerLineText(w){
   if(w.wagerType===WAGER_TYPE.MATCH_SEGMENT){
     const pickTeam = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
-    const pendingTag = w.status===WAGER_STATUS.OPEN ? ' · awaiting accept' : '';
+    const pendingTag = w.status===WAGER_STATUS.PENDING ? ' · awaiting PIN acceptance' : '';
     return `💵 ${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))} — ${fmtMoney(w.amount)} on ${escapeHtml(pickTeam)} (${segLabel(w.sessionId, segFromEnum(w.segment))})${pendingTag}`;
   }
   if(w.wagerType===WAGER_TYPE.PRESS){
@@ -1317,14 +1577,15 @@ function activeWagersStrip(sessionId, pairingId){
   `).join('')}</div>`;
 }
 
-// Trailing side can Press once down 2+ within the segment containing the current hole (Overall excluded — press is a "within the nine" bet).
+// Trailing side can Press once down 2+ within the segment containing the current hole (Overall excluded — press is a "within the nine" bet). 9-hole sessions only ever have one segment ('overall'), so a Press there always targets it.
 function pressEligibility(sessionId, pairingId, segments, curHole){
-  const segKey = sessionId==='m3' ? (curHole<5 ? 'front9':'back9') : (curHole<9 ? 'front9':'back9');
-  const seg = segments[segIndex(segKey)];
-  if(seg.final.finished) return null;
+  const session = sessionById(sessionId);
+  const segKey = (session && session.holesToPlay===9) ? 'overall' : (curHole<9 ? 'front9':'back9');
+  const seg = segments[segIndex(segKey, segments.length)];
+  if(!seg || seg.final.finished) return null;
   const pressingSide = seg.currentDiff>=2 ? 'blue' : (seg.currentDiff<=-2 ? 'red' : null);
   if(!pressingSide) return null;
-  const dup = STATE.wagers.some(w => w.wagerType===WAGER_TYPE.PRESS && w.sessionId===sessionId && w.matchId===pairingId && w.parentSegment===segKey && w.status===WAGER_STATUS.ACCEPTED);
+  const dup = STATE.wagers.some(w => w.wagerType===WAGER_TYPE.PRESS && w.sessionId===sessionId && w.matchId===pairingId && w.parentSegment===segKey && w.status===WAGER_STATUS.ACTIVE);
   if(dup) return null;
   return { segKey, pressingSide };
 }
@@ -1347,129 +1608,101 @@ function pressButton(sessionId, pairingId, segments, curHole){
 /* ---------------------------------------------------------
    Format-specific hole cards
    --------------------------------------------------------- */
-function renderBetterBallHoleCard(matchId, pairingId){
+// Single hole-scoring card, adapting to whichever format the session uses:
+//  - perPlayer + 2/side (Better Ball): 4 counter rows, best-ball net comparison
+//  - perPlayer + 1/side (Singles): 2 counter rows, individual net comparison
+//  - teamScore (Pinehurst / Standard Alt-Shot / Scramble): 2 counter rows, one blended team handicap
+function renderHoleCard(matchId, pairingId){
   const evalr = evaluateMatch(matchId, pairingId);
-  const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const overallDecided = segments[2].final.finished;
+  const { session, format, redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
+  const overallDecided = overallSegment(segments).final.finished;
   const scorecardComplete = allHolesEntered(matchId, holesDetail);
   const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
   const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
   const holeCount = holesDetail.length;
   const curHole = clampHole(matchId, holeCount);
   const h = holesDetail[curHole];
-
-  const sA1 = strokesOnHole(courseHcps.red[0], h.si);
-  const sA2 = strokesOnHole(courseHcps.red[1], h.si);
-  const sB1 = strokesOnHole(courseHcps.blue[0], h.si);
-  const sB2 = strokesOnHole(courseHcps.blue[1], h.si);
-
   const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
 
-  return `
+  const shared = `
   ${holeStepper(matchId, curHole, holeCount)}
   ${holeHeaderCard(h)}
   ${segmentBadges(segments)}
   ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
   ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
-  ${activeWagersStrip(matchId, pairingId)}
-  <div class="mx-4 mt-3">
-    ${sectionLabel(STATE.teamNames.red, RED)}
-    <div class="space-y-2">
-      ${counterRow(displayName(redPlayers[0]), null, h.raw.a1, h.par, sA1, attrs('a1'), locked, RED)}
-      ${counterRow(displayName(redPlayers[1]), null, h.raw.a2, h.par, sA2, attrs('a2'), locked, RED)}
+  ${activeWagersStrip(matchId, pairingId)}`;
+
+  const pointsNote = holeCount===9
+    ? `1.0 pt total for this 9-hole match.`
+    : `Up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).`;
+
+  let body, footnote;
+
+  if(format.scoreShape==='perPlayer' && format.playersPerSide===2){
+    const sA1 = strokesOnHole(courseHcps.red[0], h.si);
+    const sA2 = strokesOnHole(courseHcps.red[1], h.si);
+    const sB1 = strokesOnHole(courseHcps.blue[0], h.si);
+    const sB2 = strokesOnHole(courseHcps.blue[1], h.si);
+    body = `
+    <div class="mx-4 mt-3">
+      ${sectionLabel(STATE.teamNames.red, RED)}
+      <div class="space-y-2">
+        ${counterRow(displayName(redPlayers[0]), null, h.raw.a1, h.par, sA1, attrs('a1'), locked, RED)}
+        ${counterRow(displayName(redPlayers[1]), null, h.raw.a2, h.par, sA2, attrs('a2'), locked, RED)}
+      </div>
+      ${sectionLabel(STATE.teamNames.blue, BLUE)}
+      <div class="space-y-2">
+        ${counterRow(displayName(bluePlayers[0]), null, h.raw.b1, h.par, sB1, attrs('b1'), locked, BLUE)}
+        ${counterRow(displayName(bluePlayers[1]), null, h.raw.b2, h.par, sB2, attrs('b2'), locked, BLUE)}
+      </div>
+    </div>`;
+    footnote = `Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. ${pointsNote}`;
+
+  } else if(format.scoreShape==='teamScore'){
+    const sRed = strokesOnHole(courseHcps.red, h.si);
+    const sBlue = strokesOnHole(courseHcps.blue, h.si);
+    const pct = Math.round((format.teamAllowancePct==null?0.5:format.teamAllowancePct)*100);
+    body = `
+    <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
+      <span>Team Course Handicap (${pct}% combined) — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
+      <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
     </div>
-    ${sectionLabel(STATE.teamNames.blue, BLUE)}
-    <div class="space-y-2">
-      ${counterRow(displayName(bluePlayers[0]), null, h.raw.b1, h.par, sB1, attrs('b1'), locked, BLUE)}
-      ${counterRow(displayName(bluePlayers[1]), null, h.raw.b2, h.par, sB2, attrs('b2'), locked, BLUE)}
-    </div>
-  </div>
+    <div class="mx-4 mt-2 space-y-2">
+      ${counterRow(STATE.teamNames.red, `${format.label} team score`, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
+      ${counterRow(STATE.teamNames.blue, `${format.label} team score`, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
+    </div>`;
+    footnote = `${format.label}: each player's Course Handicap ≈ Index × Slope/113 + Rating − Par (halved for a 9-hole session), then the pair's two handicaps are summed and scaled to ${pct}% for one team number. ${pointsNote}`;
+
+  } else { // singles
+    const rp = redPlayers[0], bp = bluePlayers[0];
+    const sRed = strokesOnHole(courseHcps.red, h.si);
+    const sBlue = strokesOnHole(courseHcps.blue, h.si);
+    body = `
+    <div class="mx-4 mt-3 space-y-2">
+      ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
+      ${counterRow(displayName(bp), bp.name, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
+    </div>`;
+    footnote = `Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. ${pointsNote}`;
+  }
+
+  return `${shared}${body}
   ${pressButton(matchId, pairingId, segments, curHole)}
   ${holeResultStrip(h)}
   ${holeDotStrip(matchId, holesDetail, curHole)}
-  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. Each match awards up to 3.0 pts: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0).</p>`;
-}
-
-function renderPinehurstHoleCard(matchId, pairingId){
-  const evalr = evaluateMatch(matchId, pairingId);
-  const { holesDetail, segments, courseHcps } = evalr;
-  const finished = segments[2].final.finished;
-  const overallDecided = segments[2].final.finished;
-  const scorecardComplete = allHolesEntered(matchId, holesDetail);
-  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
-  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
-  const holeCount = holesDetail.length;
-  const curHole = clampHole(matchId, holeCount);
-  const h = holesDetail[curHole];
-
-  const sRed = strokesOnHole(courseHcps.red, h.si);
-  const sBlue = strokesOnHole(courseHcps.blue, h.si);
-  const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
-
-  return `
-  ${holeStepper(matchId, curHole, holeCount)}
-  ${holeHeaderCard(h)}
-  ${segmentBadges(segments)}
-  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
-  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
-  ${activeWagersStrip(matchId, pairingId)}
-  <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
-    <span>9-Hole Team Course Handicap — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
-    <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
-  </div>
-  <div class="mx-4 mt-2 space-y-2">
-    ${counterRow(STATE.teamNames.red, 'Alternate-shot team score', h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
-    ${counterRow(STATE.teamNames.blue, 'Alternate-shot team score', h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
-  </div>
-  ${pressButton(matchId, pairingId, segments, curHole)}
-  ${holeResultStrip(h)}
-  ${holeDotStrip(matchId, holesDetail, curHole)}
-  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Pinehurst/Chapman: each player's 9-hole Course Handicap ≈ (Index × Slope/113 + Rating − Par) ÷ 2, then the pair's two 9-hole handicaps are combined ÷ 2 for one team number. Points: Holes 1–5 (1.0) + Holes 6–9 (1.0) + Overall (1.0).</p>`;
-}
-
-function renderSinglesHoleCard(matchId, pairingId){
-  const evalr = evaluateMatch(matchId, pairingId);
-  const { redPlayers, bluePlayers, holesDetail, segments, courseHcps } = evalr;
-  const overallDecided = segments[2].final.finished;
-  const scorecardComplete = allHolesEntered(matchId, holesDetail);
-  const manuallyFinalized = STATE.scores[matchId][pairingId].finalized === true;
-  const locked = (scorecardComplete || manuallyFinalized) && !adminAuthenticated;
-  const holeCount = holesDetail.length;
-  const curHole = clampHole(matchId, holeCount);
-  const h = holesDetail[curHole];
-  const rp = redPlayers[0], bp = bluePlayers[0];
-
-  const sRed = strokesOnHole(courseHcps.red, h.si);
-  const sBlue = strokesOnHole(courseHcps.blue, h.si);
-  const attrs = role => `data-match="${matchId}" data-pairing="${pairingId}" data-hole="${curHole}" data-role="${role}" data-par="${h.par}"`;
-
-  return `
-  ${holeStepper(matchId, curHole, holeCount)}
-  ${holeHeaderCard(h)}
-  ${segmentBadges(segments)}
-  ${lockNote(locked, overallDecided, scorecardComplete, manuallyFinalized)}
-  ${finalizeToggleButton(matchId, pairingId, manuallyFinalized)}
-  ${activeWagersStrip(matchId, pairingId)}
-  <div class="mx-4 mt-3 space-y-2">
-    ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
-    ${counterRow(displayName(bp), bp.name, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
-  </div>
-  ${pressButton(matchId, pairingId, segments, curHole)}
-  ${holeResultStrip(h)}
-  ${holeDotStrip(matchId, holesDetail, curHole)}
-  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. Points: Front 9 (1.0) + Back 9 (1.0) + Overall (1.0) — up to 3.0 pts per singles match.</p>`;
+  <p class="mx-4 mt-3 mb-4 text-[10px] text-[#66786b]">${footnote}</p>`;
 }
 
 
 function renderMatchTab(matchId){
-  const meta = MATCH_META[matchId];
+  const session = sessionById(matchId);
+  if(!session) return `<p class="mx-4 mt-4 text-sm text-[#7f9689]">Session not found.</p>`;
   const pairs = STATE.lineups[matchId] || [];
   const course = getCourseForMatch(matchId);
 
   let header = `
   <div class="px-4 pt-4">
-    <h2 class="font-display font-700 text-lg">${meta.label}</h2>
-    <p class="text-xs text-[#7f9689]">${meta.sub}</p>
+    <h2 class="font-display font-700 text-lg">${escapeHtml(session.sessionName)}</h2>
+    <p class="text-xs text-[#7f9689]">${escapeHtml(sessionSubLabel(session))}</p>
   </div>
   ${courseBanner(course)}`;
 
@@ -1481,10 +1714,7 @@ function renderMatchTab(matchId){
   const activePairingId = pairs[pairIdx].id;
 
   let body = pillRow(pairs.map(p=>pairingLabel(matchId,p)), pairIdx, `data-pairing-select-${matchId}`);
-
-  if(matchId==='m3') body += renderPinehurstHoleCard(matchId, activePairingId);
-  else if(matchId==='m4') body += renderSinglesHoleCard(matchId, activePairingId);
-  else body += renderBetterBallHoleCard(matchId, activePairingId);
+  body += renderHoleCard(matchId, activePairingId);
 
   return header + body;
 }
@@ -1528,6 +1758,13 @@ function renderRosterSection(){
                 class="team-field flex-1 min-w-0 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-[10px] focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
               <span class="text-[10px] font-display font-600 flex-shrink-0 ${p.wagerBalance>0?'text-[#7be6a4]':p.wagerBalance<0?'text-[#f2a1ab]':'text-[#7f9689]'}" title="Net wager win/loss so far">${fmtMoney(p.wagerBalance||0)}</span>
             </div>
+            <div class="flex items-center gap-1.5">
+              <span class="text-[9px] text-[#7f9689] flex-shrink-0">🔑 PIN</span>
+              <input value="${escapeAttr(p.pin||'')}" placeholder="0000" maxlength="4" inputmode="numeric" data-field="ppin" data-side="${sideKey}" data-player="${p.id}"
+                title="4-digit handshake PIN — required to propose, accept, or call a Press"
+                class="team-field w-16 bg-[#101a14] border border-[#243527] rounded px-1.5 py-1 text-[11px] font-display font-600 tracking-widest text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+              <span class="text-[9px] text-[#66786b]">verifies wagers &amp; presses on this player's behalf</span>
+            </div>
           </div>
         `).join('')}
       </div>
@@ -1546,8 +1783,91 @@ function renderRosterSection(){
   </div>`;
 }
 
+/* =========================================================
+   PLAYER PIN MANAGEMENT — bulk generate / reset / export
+   ========================================================= */
+function isEmptyPin(pin){
+  return !pin || pin === '0000' || pin.length !== 4;
+}
+
+function generateUniquePin(existingPins){
+  let pin, attempts = 0;
+  do {
+    pin = String(1000 + Math.floor(Math.random() * 9000));
+    attempts++;
+  } while(existingPins.has(pin) && attempts < 200);
+  existingPins.add(pin);
+  return pin;
+}
+
+// Only fills PINs that are missing/placeholder — never overwrites a PIN someone already set.
+function generateRandomPinsForEmpty(){
+  const all = allPlayersFlat();
+  const existingPins = new Set(all.map(p => p.pin).filter(pin => !isEmptyPin(pin)));
+  let filled = 0;
+  all.forEach(p => {
+    if(isEmptyPin(p.pin)){
+      p.pin = generateUniquePin(existingPins);
+      filled++;
+    }
+  });
+  return filled;
+}
+
+function buildPinListText(){
+  const lines = [`🐢 Turtle Cup — Player PINs`, ''];
+  lines.push(`${STATE.teamNames.red}:`);
+  STATE.roster.red.forEach(p => lines.push(`  ${displayName(p)} (${p.name}) — ${p.pin || '----'}`));
+  lines.push('');
+  lines.push(`${STATE.teamNames.blue}:`);
+  STATE.roster.blue.forEach(p => lines.push(`  ${displayName(p)} (${p.name}) — ${p.pin || '----'}`));
+  lines.push('', 'Keep this list private — anyone with a PIN can propose or accept wagers as that player.');
+  return lines.join('\n');
+}
+
+function renderPinManagementSection(){
+  const allPlayers = [...STATE.roster.red.map(p=>({...p, side:'red'})), ...STATE.roster.blue.map(p=>({...p, side:'blue'}))];
+  const rows = allPlayers.map(p => `
+    <tr class="border-b border-[#182319] last:border-0">
+      <td class="px-2 py-1.5 text-xs text-[#eef3ee] whitespace-nowrap">${escapeHtml(displayName(p))} <span class="text-[#7f9689]">— ${escapeHtml(p.name)}</span></td>
+      <td class="px-2 py-1.5 text-center"><span class="w-2.5 h-2.5 inline-block rounded-full" style="background:${p.side==='red'?RED:BLUE}" title="${p.side==='red'?escapeAttr(STATE.teamNames.red):escapeAttr(STATE.teamNames.blue)}"></span></td>
+      <td class="px-2 py-1.5">
+        <input id="pinRow_${p.id}" value="${escapeAttr(p.pin||'')}" maxlength="4" inputmode="numeric" placeholder="0000"
+          class="w-16 bg-[#0e1712] border border-[#24352a] rounded px-1.5 py-1 text-xs font-display font-600 tracking-widest text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      </td>
+      <td class="px-2 py-1.5">
+        <button data-action="save-single-pin" data-player="${p.id}" data-side="${p.side}" class="text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Save</button>
+      </td>
+    </tr>`).join('');
+
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">🔑 Player PIN Management</h2>
+    <p class="text-xs text-[#7f9689]">Every player's 4-digit PIN authorizes their own wagers and Press calls — assign, regenerate, or share the whole list here.</p>
+  </div>
+  <div class="mx-4 mb-3 overflow-x-auto rounded-xl border border-[#1f2f26]">
+    <table class="w-full text-xs border-collapse min-w-[380px]">
+      <thead>
+        <tr class="bg-[#16221a] text-[#9db3a4]">
+          <th class="px-2 py-2 text-left font-medium">Player</th>
+          <th class="px-2 py-2 font-medium">Team</th>
+          <th class="px-2 py-2 font-medium">PIN</th>
+          <th class="px-2 py-2 font-medium"></th>
+        </tr>
+      </thead>
+      <tbody class="bg-[#0f1913]">${rows}</tbody>
+    </table>
+  </div>
+  <div class="mx-4 mb-6 flex flex-wrap gap-2">
+    <button data-action="generate-random-pins" class="text-[11px] font-semibold px-3 py-2 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">🎲 Generate Random PINs</button>
+    <button data-action="reset-default-pins" class="text-[11px] font-semibold px-3 py-2 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] hover:border-[#e2696f] active:scale-95 transition">↺ Set All Default (0000)</button>
+    <button data-action="copy-pin-list" class="text-[11px] font-semibold px-3 py-2 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] hover:border-[#3fae6a] active:scale-95 transition">📋 Copy PIN List</button>
+  </div>
+  <p class="mx-4 mb-6 text-[10px] text-[#66786b]">"Generate Random PINs" only fills players with no PIN set (or the "0000" placeholder) — it never overwrites a PIN someone already chose. "Set All Default" overwrites every PIN, including personalized ones.</p>`;
+}
+
 function renderCourseSection(){
-  const inUse = new Set(Object.values(STATE.matchCourse));
+  const inUse = new Set(STATE.sessions.map(s=>s.courseId));
   const cards = STATE.courses.map(c => {
     const open = !!STATE.ui.courseEditorOpen[c.id];
     const holesGrid = open ? `
@@ -1597,7 +1917,7 @@ function renderCourseSection(){
   return `
   <div class="px-4 pt-5 pb-1">
     <h2 class="font-display font-700 text-lg">Course Database</h2>
-    <p class="text-xs text-[#7f9689]">Rating, Slope, and per-hole Par/SI drive every scorecard's Course Handicap. Assign a course to each match in the Lineup Builder below.</p>
+    <p class="text-xs text-[#7f9689]">Rating, Slope, and per-hole Par/SI drive every scorecard's Course Handicap. Assign a course to each session in the Schedule &amp; Format Manager below.</p>
   </div>
   ${cards}
   <div class="mx-4 mb-3">
@@ -1606,14 +1926,16 @@ function renderCourseSection(){
 }
 
 function renderLineupSection(){
-  const cards = Object.keys(MATCH_META).map(mid => {
-    const meta = MATCH_META[mid];
+  const cards = sessionIds().map(mid => {
+    const session = sessionById(mid);
+    const fmt = formatMeta(session.format);
+    const singles = fmt.playersPerSide===1;
     const pairs = STATE.lineups[mid] || [];
-    const usedRed = new Set(pairs.flatMap(p => mid==='m4' ? [p.red] : p.red));
-    const usedBlue = new Set(pairs.flatMap(p => mid==='m4' ? [p.blue] : p.blue));
+    const usedRed = new Set(pairs.flatMap(p => singles ? [p.red] : p.red));
+    const usedBlue = new Set(pairs.flatMap(p => singles ? [p.blue] : p.blue));
     const availRed = STATE.roster.red.filter(p => !usedRed.has(p.id));
     const availBlue = STATE.roster.blue.filter(p => !usedBlue.has(p.id));
-    const draft = STATE.ui.draft[mid];
+    const draft = STATE.ui.draft[mid] || (singles ? {r:'',b:''} : {r1:'',r2:'',b1:'',b2:''});
 
     const existing = pairs.map(p => `
       <div class="flex items-center justify-between bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-1.5 text-xs">
@@ -1622,7 +1944,7 @@ function renderLineupSection(){
       </div>`).join('');
 
     let addForm;
-    if(mid==='m4'){
+    if(singles){
       addForm = `
         <div class="grid grid-cols-2 gap-2 mt-2">
           <select data-action="draft-select" data-match="${mid}" data-field="r" class="bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
@@ -1659,14 +1981,8 @@ function renderLineupSection(){
     return `
     <div class="mx-4 mb-3 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
       <div class="flex items-center justify-between">
-        <span class="font-display font-600 text-sm">${meta.label}</span>
-        <span class="text-[10px] text-[#7f9689]">${meta.sub}</span>
-      </div>
-      <div class="flex items-center gap-2 mt-2">
-        <span class="text-[10px] text-[#7f9689] flex-shrink-0">⛳ Course</span>
-        <select data-action="course-select" data-match="${mid}" class="flex-1 min-w-0 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
-          ${STATE.courses.map(c=>`<option value="${c.id}" ${c.id===STATE.matchCourse[mid]?'selected':''}>${escapeHtml(c.name)} (Par ${courseParTotal(c)} · ${c.rating.toFixed(1)}/${c.slope})</option>`).join('')}
-        </select>
+        <span class="font-display font-600 text-sm">${escapeHtml(session.sessionName)}</span>
+        <span class="text-[10px] text-[#7f9689]">${escapeHtml(sessionSubLabel(session))}</span>
       </div>
       <div class="space-y-1.5 mt-2">${existing || `<p class="text-[11px] text-[#66786b]">No pairings yet.</p>`}</div>
       ${addForm}
@@ -1677,7 +1993,7 @@ function renderLineupSection(){
   return `
   <div class="px-4 pt-5 pb-1">
     <h2 class="font-display font-700 text-lg">Captain Lineup Builder</h2>
-    <p class="text-xs text-[#7f9689]">Set independent 2-man pairings for Matches 1–3 and singles pairings for Match 4. A player can't be double-booked within the same match.</p>
+    <p class="text-xs text-[#7f9689]">Set 2-man pairings for team formats, or singles pairings for 1v1 sessions — this follows whatever format each session uses in the Schedule &amp; Format Manager below. A player can't be double-booked within the same session.</p>
   </div>
   ${cards}`;
 }
@@ -1686,7 +2002,7 @@ function renderCloudSyncSection(){
   const cfg = loadSupabaseConfig();
   const urlVal = cfg ? cfg.url : '';
   const keyVal = cfg ? cfg.anonKey : '';
-  const hasDefaults = !!(DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_ANON_KEY);
+  const hasDefaults = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
   let statusBadge;
   if(cloudStatus==='connected'){
@@ -1730,18 +2046,19 @@ function renderCloudSyncSection(){
     <summary class="cursor-pointer text-[#9db3a4] font-medium">First time? One-time Supabase table setup ▾</summary>
     <div class="mt-2 space-y-2">
       <p>1. Create a free project at supabase.com, then open the SQL editor and run:</p>
-      <pre class="bg-[#0e1712] border border-[#24352a] rounded-lg p-2 overflow-x-auto text-[10px] text-[#c9d8cd]">create table turtle_cup_state (
+      <pre class="bg-[#0e1712] border border-[#24352a] rounded-lg p-2 overflow-x-auto text-[10px] text-[#c9d8cd]">create table ${SUPABASE_TABLE} (
   id bigint primary key,
   data jsonb not null,
   updated_at timestamptz default now()
 );
-alter table turtle_cup_state enable row level security;
-create policy "anon read" on turtle_cup_state for select using (true);
-create policy "anon write" on turtle_cup_state for insert with check (true);
-create policy "anon update" on turtle_cup_state for update using (true);
-alter publication supabase_realtime add table turtle_cup_state;</pre>
+alter table ${SUPABASE_TABLE} enable row level security;
+create policy "anon read" on ${SUPABASE_TABLE} for select using (true);
+create policy "anon write" on ${SUPABASE_TABLE} for insert with check (true);
+create policy "anon update" on ${SUPABASE_TABLE} for update using (true);
+alter publication supabase_realtime add table ${SUPABASE_TABLE};</pre>
       <p>2. Copy your Project URL and <b>anon public</b> key from Project Settings → API, paste them above, and hit Connect on every device you want synced.</p>
       <p class="text-[#e2696f]">⚠ These policies make the table fully readable/writable by anyone with your URL + anon key — fine for a private group of golfers, not something to post publicly.</p>
+      <p class="pt-1 border-t border-[#1f2f26] mt-1">This deployment is wired to table <code class="text-[#8fc4f2]">${escapeHtml(SUPABASE_TABLE)}</code> on realtime channel <code class="text-[#8fc4f2]">${escapeHtml(SUPABASE_CHANNEL)}</code>. Different Vercel Preview branches can point at different tables/channels (via <code>window.ENV_SUPABASE_TABLE</code> / <code>window.ENV_SUPABASE_CHANNEL</code>) on the same Supabase project without their realtime updates crossing over.</p>
     </div>
   </details>`;
 }
@@ -1801,7 +2118,7 @@ function playerOptionsHtml(selectedId, excludeId){
 
 function renderWagerProposeForm(){
   const d = STATE.ui.wagerDraft;
-  const matchOptions = Object.keys(MATCH_META).filter(mid => (STATE.lineups[mid]||[]).length>0);
+  const matchOptions = sessionIds().filter(mid => (STATE.lineups[mid]||[]).length>0);
   const selectCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
 
   const kindTabs = ['match','prop'].map(k => `
@@ -1816,7 +2133,7 @@ function renderWagerProposeForm(){
     <div class="space-y-2 mt-2">
       <select data-action="wager-draft-select" data-field="matchId" class="${selectCls}">
         <option value="">Choose match…</option>
-        ${matchOptions.map(mid=>`<option value="${mid}" ${d.matchId===mid?'selected':''}>${MATCH_META[mid].label}</option>`).join('')}
+        ${matchOptions.map(mid=>`<option value="${mid}" ${d.matchId===mid?'selected':''}>${sessionLabel(mid)}</option>`).join('')}
       </select>
       ${d.matchId ? `
       <select data-action="wager-draft-select" data-field="pairingId" class="${selectCls}">
@@ -1912,11 +2229,12 @@ function renderWagerProposeForm(){
 
 function wagerStatusPill(status){
   const map = {
-    OPEN: 'bg-[#3a2f12] border-[#7d6a2f] text-[#f2d17f]',
-    ACCEPTED: 'bg-[#132436] border-[#2f5a7d] text-[#8fc4f2]',
+    PENDING: 'bg-[#3a2f12] border-[#7d6a2f] text-[#f2d17f]',
+    ACTIVE: 'bg-[#132436] border-[#2f5a7d] text-[#8fc4f2]',
     SETTLED: 'bg-[#123a22] border-[#2f7d4f] text-[#7be6a4]',
     PUSHED: 'bg-[#161f1a] border-[#3a3527] text-[#d9c88f]',
     DECLINED: 'bg-[#161f1a] border-[#243527] text-[#7f9689]',
+    VOID: 'bg-[#2a1418] border-[#7d2f3a] text-[#f2a1ab]',
   };
   return `<span class="flex-shrink-0 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full border ${map[status]||map.DECLINED}">${status.toLowerCase()}</span>`;
 }
@@ -1926,13 +2244,14 @@ function wagerCardDescription(w){
     const pickTeam = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
     const pair = (STATE.lineups[w.sessionId]||[]).find(p=>p.id===w.matchId);
     const matchupText = pair ? pairingLabel(w.sessionId, pair) : 'Unknown pairing';
-    return `${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))} · ${MATCH_META[w.sessionId]?.label||w.sessionId} · ${escapeHtml(matchupText)} · ${segLabel(w.sessionId, segFromEnum(w.segment))} — creator picks ${escapeHtml(pickTeam)}`;
+    return `${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))} · ${sessionLabel(w.sessionId)} · ${escapeHtml(matchupText)} · ${segLabel(w.sessionId, segFromEnum(w.segment))} — creator picks ${escapeHtml(pickTeam)}`;
   }
   if(w.wagerType===WAGER_TYPE.PRESS){
     const team = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
     const pair = (STATE.lineups[w.sessionId]||[]).find(p=>p.id===w.matchId);
     const matchupText = pair ? pairingLabel(w.sessionId, pair) : '';
-    return `Press by ${escapeHtml(team)} · ${MATCH_META[w.sessionId]?.label||w.sessionId} · ${escapeHtml(matchupText)} · ${w.segment}`;
+    const byWhom = w.creatorId ? ` · called by ${escapeHtml(displayName(playerById(w.creatorId)))}` : '';
+    return `Press by ${escapeHtml(team)}${byWhom} · ${sessionLabel(w.sessionId)} · ${escapeHtml(matchupText)} · ${w.segment}`;
   }
   const kindLabels = { medalist:'Low Net Medalist', birdieKing:'Birdie King', champion:'Tournament Champion', custom:'Custom Prop' };
   if(w.propKind==='custom') return `Custom: ${escapeHtml(w.label||'')} — ${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))}`;
@@ -1951,8 +2270,8 @@ function wagerOutcomeText(w){
 }
 
 function renderWagerCard(w){
-  const isPending = w.status===WAGER_STATUS.OPEN;
-  const canManuallySettle = w.wagerType===WAGER_TYPE.PROP && w.status===WAGER_STATUS.ACCEPTED && adminAuthenticated;
+  const isPending = w.status===WAGER_STATUS.PENDING;
+  const canManuallySettle = w.wagerType===WAGER_TYPE.PROP && w.status===WAGER_STATUS.ACTIVE && adminAuthenticated;
   return `
   <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
     <div class="flex items-start justify-between gap-2">
@@ -1976,21 +2295,21 @@ function renderWagerCard(w){
 }
 
 function renderWagerCentralTab(){
-  const pending = STATE.wagers.filter(w=>w.status===WAGER_STATUS.OPEN);
-  const active = STATE.wagers.filter(w=>w.status===WAGER_STATUS.ACCEPTED);
-  const settled = STATE.wagers.filter(w=>w.status===WAGER_STATUS.SETTLED || w.status===WAGER_STATUS.PUSHED || w.status===WAGER_STATUS.DECLINED).slice().reverse();
+  const pending = STATE.wagers.filter(w=>w.status===WAGER_STATUS.PENDING);
+  const active = STATE.wagers.filter(w=>w.status===WAGER_STATUS.ACTIVE);
+  const settled = STATE.wagers.filter(w=>w.status===WAGER_STATUS.SETTLED || w.status===WAGER_STATUS.PUSHED || w.status===WAGER_STATUS.DECLINED || w.status===WAGER_STATUS.VOID).slice().reverse();
 
   return `
   <div class="px-4 pt-4 pb-2">
     <h2 class="font-display font-700 text-lg">🎲 Wager Central</h2>
-    <p class="text-xs text-[#7f9689]">Propose a $ side bet, accept or decline what's on the table, and watch it settle automatically as matches finish. Every dollar flows through the Settlement tab at the end.</p>
+    <p class="text-xs text-[#7f9689]">Propose a $ side bet — the proposer's PIN locks it in, and the other player's PIN activates it. Everything settles automatically as matches finish and flows through the Settlement tab.</p>
   </div>
   ${renderWagerProposeForm()}
-  ${pending.length ? `<h3 class="mx-4 font-display font-600 text-sm text-[#f2d17f] mb-2">⏳ Awaiting Response (${pending.length})</h3>${pending.map(renderWagerCard).join('')}` : ''}
+  ${pending.length ? `<h3 class="mx-4 font-display font-600 text-sm text-[#f2d17f] mb-2">⏳ Awaiting PIN (${pending.length})</h3>${pending.map(renderWagerCard).join('')}` : ''}
   ${active.length ? `<h3 class="mx-4 mt-4 font-display font-600 text-sm text-[#8fc4f2] mb-2">🔥 Active (${active.length})</h3>${active.map(renderWagerCard).join('')}` : ''}
   ${(!pending.length && !active.length) ? `<p class="mx-4 text-sm text-[#7f9689] mb-4">No open wagers. Propose one above.</p>` : ''}
   <details class="mx-4 mt-4 mb-8">
-    <summary class="cursor-pointer text-xs text-[#9db3a4] font-medium">Settled &amp; Declined (${settled.length}) ▾</summary>
+    <summary class="cursor-pointer text-xs text-[#9db3a4] font-medium">Settled, Declined &amp; Voided (${settled.length}) ▾</summary>
     <div class="mt-2">${settled.length ? settled.map(renderWagerCard).join('') : `<p class="text-[11px] text-[#66786b] py-2">Nothing settled yet.</p>`}</div>
   </details>`;
 }
@@ -2015,9 +2334,9 @@ function renderSettlementTab(){
   const { rows, purse } = computeFinalNetBalances();
   const txns = computeSettlementTransactions(rows);
   const rankedRows = rows.slice().sort((a,b)=>b.finalNet-a.finalNet);
-  const allMatchesDone = Object.keys(MATCH_META).every(mid => allPairingIds(mid).every(pid => {
+  const allMatchesDone = sessionIds().every(mid => allPairingIds(mid).every(pid => {
     const evalr = evaluateMatch(mid, pid);
-    return evalr && evalr.segments[2].final.finished;
+    return evalr && overallSegment(evalr.segments).final.finished;
   }) || allPairingIds(mid).length===0);
 
   const purseRows = [
@@ -2089,14 +2408,118 @@ function renderAdminSecuritySection(){
   </div>`;
 }
 
+function renderDisputeWagerCard(w){
+  const canForceAccept = w.status===WAGER_STATUS.PENDING;
+  const canVoid = w.status===WAGER_STATUS.PENDING || w.status===WAGER_STATUS.ACTIVE;
+  const canEditAmount = w.status===WAGER_STATUS.PENDING || w.status===WAGER_STATUS.ACTIVE;
+  return `
+  <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+    <div class="flex items-start justify-between gap-2">
+      <div class="text-xs text-[#eef3ee] font-medium">${wagerCardDescription(w)}</div>
+      ${wagerStatusPill(w.status)}
+    </div>
+    <div class="flex items-center gap-2 mt-1.5 flex-wrap">
+      <span class="text-[11px] text-[#d9b25c] font-display font-600">${fmtMoney(w.amount)} stake</span>
+      ${canEditAmount ? `
+        <input type="number" min="1" step="1" value="${w.amount}" data-action="dispute-amount-input" data-wager="${w.wagerId}"
+          class="w-20 bg-[#0e1712] border border-[#24352a] rounded px-1.5 py-1 text-[11px] text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+        <button data-action="dispute-save-amount" data-wager="${w.wagerId}" class="text-[10px] font-semibold px-2 py-1 rounded bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Save</button>
+      ` : ''}
+    </div>
+    ${(w.status===WAGER_STATUS.SETTLED||w.status===WAGER_STATUS.PUSHED) ? `<div class="text-[11px] text-[#7be6a4] mt-1">${wagerOutcomeText(w)}</div>` : ''}
+    ${w.status===WAGER_STATUS.VOID ? `<div class="text-[11px] text-[#f2a1ab] mt-1">Voided by admin — no money moved.</div>` : ''}
+    ${(canForceAccept || canVoid) ? `
+    <div class="flex flex-wrap gap-2 mt-2">
+      ${canForceAccept ? `<button data-action="dispute-force-accept" data-wager="${w.wagerId}" class="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg bg-[#123a22] border border-[#2f7d4f] text-[#7be6a4] active:scale-95 transition">✓ Force Accept</button>` : ''}
+      ${canVoid ? `<button data-action="dispute-void" data-wager="${w.wagerId}" class="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg bg-[#2a1418] border border-[#7d2f3a] text-[#f2a1ab] active:scale-95 transition">✗ Void Wager</button>` : ''}
+    </div>` : ''}
+  </div>`;
+}
+
+function renderWagerDisputeSection(){
+  const all = STATE.wagers.slice().sort((a,b)=>b.createdAt-a.createdAt);
+  const counts = {
+    pending: all.filter(w=>w.status===WAGER_STATUS.PENDING).length,
+    active: all.filter(w=>w.status===WAGER_STATUS.ACTIVE).length,
+    settled: all.filter(w=>w.status===WAGER_STATUS.SETTLED || w.status===WAGER_STATUS.PUSHED).length,
+  };
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">⚖️ Wager Management &amp; Dispute</h2>
+    <p class="text-xs text-[#7f9689]">${counts.pending} pending · ${counts.active} active · ${counts.settled} settled. Force-accept a stuck wager, void a disputed one, or correct a stake — these bypass player PIN verification, so use them for genuine disputes only.</p>
+  </div>
+  ${all.length ? all.map(renderDisputeWagerCard).join('') : `<p class="mx-4 mb-6 text-sm text-[#7f9689]">No wagers have been proposed yet.</p>`}
+  <div class="mx-4 mb-2"></div>`;
+}
+
+function renderScheduleManagerSection(){
+  const fieldCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
+  const cards = STATE.sessions.map((s, idx) => {
+    const pairCount = (STATE.lineups[s.sessionId]||[]).length;
+    return `
+    <div class="mx-4 mb-3 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
+      <div class="flex items-center gap-2 mb-2">
+        <input value="${escapeAttr(s.sessionName)}" data-action="session-field" data-session="${s.sessionId}" data-field="sessionName"
+          class="flex-1 min-w-0 bg-transparent font-display font-600 text-sm focus:outline-none border-b border-transparent focus:border-[#3fae6a]" />
+        <button data-action="move-session" data-session="${s.sessionId}" data-dir="-1" ${idx===0?'disabled':''} class="text-xs w-7 h-7 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] disabled:opacity-20 disabled:cursor-not-allowed flex-shrink-0">↑</button>
+        <button data-action="move-session" data-session="${s.sessionId}" data-dir="1" ${idx===STATE.sessions.length-1?'disabled':''} class="text-xs w-7 h-7 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] disabled:opacity-20 disabled:cursor-not-allowed flex-shrink-0">↓</button>
+        <button data-action="delete-session" data-session="${s.sessionId}" ${STATE.sessions.length<=1?'disabled':''} title="Delete session" class="text-[#e2696f] text-xs w-7 h-7 rounded-lg bg-[#16241b] border border-[#243527] disabled:opacity-20 disabled:cursor-not-allowed flex-shrink-0">✕</button>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="text-[10px] text-[#7f9689]">Date
+          <input type="date" value="${escapeAttr(s.date)}" data-action="session-field" data-session="${s.sessionId}" data-field="date" class="${fieldCls} mt-0.5" />
+        </label>
+        <label class="text-[10px] text-[#7f9689]">Time of Day
+          <select data-action="session-field" data-session="${s.sessionId}" data-field="timeOfDay" class="${fieldCls} mt-0.5">
+            <option value="AM" ${s.timeOfDay==='AM'?'selected':''}>AM</option>
+            <option value="PM" ${s.timeOfDay==='PM'?'selected':''}>PM</option>
+          </select>
+        </label>
+        <label class="text-[10px] text-[#7f9689] col-span-2">Course
+          <select data-action="session-field" data-session="${s.sessionId}" data-field="courseId" class="${fieldCls} mt-0.5">
+            ${STATE.courses.map(c=>`<option value="${c.id}" ${c.id===s.courseId?'selected':''}>${escapeHtml(c.name)} (Par ${courseParTotal(c)} · ${c.rating.toFixed(1)}/${c.slope})</option>`).join('')}
+          </select>
+        </label>
+        <label class="text-[10px] text-[#7f9689] col-span-2">Format
+          <select data-action="session-field" data-session="${s.sessionId}" data-field="format" class="${fieldCls} mt-0.5">
+            ${FORMAT_ORDER.map(fk=>`<option value="${fk}" ${fk===s.format?'selected':''}>${escapeHtml(FORMAT_META[fk].label)}</option>`).join('')}
+          </select>
+        </label>
+        <label class="text-[10px] text-[#7f9689] col-span-2">Holes to Play
+          <div class="flex gap-2 mt-0.5">
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="holesToPlay" data-value="9"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${s.holesToPlay===9 ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">9 Holes</button>
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="holesToPlay" data-value="18"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${s.holesToPlay===18 ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">18 Holes</button>
+          </div>
+        </label>
+      </div>
+      <p class="text-[10px] text-[#66786b] mt-2">${escapeHtml(sessionSubLabel(s))} · ${pairCount} pairing${pairCount===1?'':'s'} · worth ${s.holesToPlay===9?'1.0 pt':'3.0 pts'} per pairing</p>
+    </div>`;
+  }).join('');
+
+  return `
+  <div class="px-4 pt-5 pb-1">
+    <h2 class="font-display font-700 text-lg">📅 Schedule &amp; Format Manager</h2>
+    <p class="text-xs text-[#7f9689]">Every match tab, scorecard, and points calculation generates from this list. Add a session for each round of the trip, pick its course and format, and choose 9 or 18 holes — 9-hole sessions are worth 1.0 point total, 18-hole sessions keep the 3-point Front/Back/Overall structure.</p>
+  </div>
+  ${cards}
+  <div class="mx-4 mb-3">
+    <button data-action="add-session" class="w-full text-[11px] font-medium py-1.5 rounded-lg border border-dashed border-[#3fae6a] text-[#7be6a4] hover:bg-[#123a22]/30 transition">+ Add New Session</button>
+  </div>`;
+}
+
 function renderAdminTab(){
   return `
   ${renderAdminSecuritySection()}
   ${renderCloudSyncSection()}
   ${renderPurseSection()}
   ${renderRosterSection()}
+  ${renderPinManagementSection()}
   ${renderCourseSection()}
+  ${renderScheduleManagerSection()}
   ${renderLineupSection()}
+  ${renderWagerDisputeSection()}
   <div class="mx-4 mb-6"></div>`;
 }
 
@@ -2104,7 +2527,7 @@ function renderAdminTab(){
    POST-MATCH RECAP — metrics computation
    ========================================================= */
 function pairingStatusLine(evalr){
-  const overall = evalr.segments[2];
+  const overall = overallSegment(evalr.segments);
   const f = overall.final;
   if(f.finished){
     return f.winner==='halved' ? 'Halved' : `${f.winner==='a'?STATE.teamNames.red:STATE.teamNames.blue} win ${f.closeout}`;
@@ -2116,7 +2539,7 @@ function pairingStatusLine(evalr){
 
 // Lower = tighter match. Decided halves score 0 (tightest possible). In-progress matches use the live gap.
 function marginOf(evalr){
-  const overall = evalr.segments[2];
+  const overall = overallSegment(evalr.segments);
   const f = overall.final;
   if(f.finished){
     if(f.winner==='halved') return 0;
@@ -2137,8 +2560,8 @@ function collectSessionPairings(sessionIds){
   return out;
 }
 
-function computeSessionMetrics(sessionIds){
-  const pairings = collectSessionPairings(sessionIds);
+function computeSessionMetrics(sessionIdList){
+  const pairings = collectSessionPairings(sessionIdList);
 
   // ---- Low Net Medalist: lowest total net strokes among individually-scored players ----
   const netTotals = {}; // playerId -> { name, color, total, holes }
@@ -2149,19 +2572,19 @@ function computeSessionMetrics(sessionIds){
     netTotals[player.id].holes += 1;
   }
   pairings.forEach(({ matchId, evalr }) => {
-    if(matchId==='m1' || matchId==='m2'){
-      const { redPlayers, bluePlayers, holesDetail } = evalr;
+    const fmt = evalr.format;
+    const { redPlayers, bluePlayers, holesDetail } = evalr;
+    if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
       holesDetail.forEach(h => {
         addNet(redPlayers[0], RED, h.a1); addNet(redPlayers[1], RED, h.a2);
         addNet(bluePlayers[0], BLUE, h.b1); addNet(bluePlayers[1], BLUE, h.b2);
       });
-    } else if(matchId==='m4'){
-      const { redPlayers, bluePlayers, holesDetail } = evalr;
+    } else if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===1){
       holesDetail.forEach(h => {
         addNet(redPlayers[0], RED, h.aNet); addNet(bluePlayers[0], BLUE, h.bNet);
       });
     }
-    // m3 (Pinehurst) has no individual net breakdown — intentionally excluded from medalist race.
+    // Team-score formats (Pinehurst/Alt-Shot/Scramble) have no individual net breakdown — intentionally excluded from the medalist race.
   });
   let medalist = null;
   Object.values(netTotals).forEach(v => {
@@ -2170,7 +2593,7 @@ function computeSessionMetrics(sessionIds){
   });
 
   // ---- Dogfight (tightest) & Hammer (biggest blowout) among matches with at least one hole entered ----
-  const withData = pairings.filter(pe => pe.evalr.segments[2].enteredCount > 0);
+  const withData = pairings.filter(pe => overallSegment(pe.evalr.segments).enteredCount > 0);
   let dogfight = null, hammer = null;
   withData.forEach(pe => {
     const m = marginOf(pe.evalr);
@@ -2178,15 +2601,16 @@ function computeSessionMetrics(sessionIds){
     if(hammer===null || m > hammer.margin) hammer = { ...pe, margin: m };
   });
 
-  // ---- Birdie King: most gross birdies + net eagles, players individually or teams for Pinehurst ----
+  // ---- Birdie King: most gross birdies + net eagles, individually or by team for team-score formats ----
   const birdieCounts = {}; // key -> { label, color, count }
   function bump(key, label, color){
     if(!birdieCounts[key]) birdieCounts[key] = { label, color, count: 0 };
     birdieCounts[key].count += 1;
   }
   pairings.forEach(({ matchId, evalr }) => {
+    const fmt = evalr.format;
     const { redPlayers, bluePlayers, holesDetail } = evalr;
-    if(matchId==='m1' || matchId==='m2'){
+    if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
       holesDetail.forEach(h => {
         if(h.raw.a1!=='' && h.raw.a1===h.par-1) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
         if(h.raw.a2!=='' && h.raw.a2===h.par-1) bump('p:'+redPlayers[1].id, displayName(redPlayers[1]), RED);
@@ -2197,14 +2621,14 @@ function computeSessionMetrics(sessionIds){
         if(h.b1!=null && h.b1===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
         if(h.b2!=null && h.b2===h.par-2) bump('p:'+bluePlayers[1].id, displayName(bluePlayers[1]), BLUE);
       });
-    } else if(matchId==='m4'){
+    } else if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===1){
       holesDetail.forEach(h => {
         if(h.raw.a!=='' && h.raw.a===h.par-1) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
         if(h.raw.b!=='' && h.raw.b===h.par-1) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
         if(h.aNet!=null && h.aNet===h.par-2) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
         if(h.bNet!=null && h.bNet===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
       });
-    } else if(matchId==='m3'){
+    } else if(fmt.scoreShape==='teamScore'){
       holesDetail.forEach(h => {
         if(h.raw.a!=='' && h.raw.a===h.par-1) bump('team:red', STATE.teamNames.red, RED);
         if(h.raw.b!=='' && h.raw.b===h.par-1) bump('team:blue', STATE.teamNames.blue, BLUE);
@@ -2236,9 +2660,10 @@ function awardCard(icon, title, body, sub){
   </div>`;
 }
 
-function recapMatchBreakdown(sessionIds){
-  return sessionIds.map(mid => {
-    const meta = MATCH_META[mid];
+function recapMatchBreakdown(sessionIdList){
+  return sessionIdList.map(mid => {
+    const session = sessionById(mid);
+    if(!session) return '';
     const pairs = STATE.lineups[mid] || [];
     if(pairs.length===0) return '';
     const cards = pairs.map(pair => {
@@ -2262,8 +2687,8 @@ function recapMatchBreakdown(sessionIds){
     return `
     <div class="mb-5">
       <div class="flex items-center gap-2 mb-2">
-        <h3 class="font-display font-700 text-base md:text-lg text-[#eef3ee]">${meta.label}</h3>
-        <span class="text-[11px] text-[#7f9689]">${meta.sub}</span>
+        <h3 class="font-display font-700 text-base md:text-lg text-[#eef3ee]">${escapeHtml(session.sessionName)}</h3>
+        <span class="text-[11px] text-[#7f9689]">${escapeHtml(sessionSubLabel(session))}</span>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5">${cards}</div>
     </div>`;
@@ -2273,15 +2698,15 @@ function recapMatchBreakdown(sessionIds){
 function renderRecapOverlay(){
   if(!STATE.ui.recap.open) return '';
   const session = STATE.ui.recap.session;
-  const sessionIds = session==='all' ? Object.keys(MATCH_META) : [session];
-  const metrics = computeSessionMetrics(sessionIds);
+  const sessionIdList = session==='all' ? sessionIds() : [session];
+  const metrics = computeSessionMetrics(sessionIdList);
   const st = computeStandings();
   const totalForBar = Math.max(st.totalAvailable, 1);
   const redPct = (st.red/totalForBar)*100;
   const bluePct = (st.blue/totalForBar)*100;
 
   const sessionTabs = [
-    ...Object.values(MATCH_META).map(m => ({ id: m.id, label: m.label })),
+    ...STATE.sessions.map(s => ({ id: s.sessionId, label: s.sessionName })),
     { id:'all', label:'Full Tournament' },
   ];
 
@@ -2289,10 +2714,10 @@ function renderRecapOverlay(){
   const medalistSub = metrics.medalist ? `${metrics.medalist.total} net strokes · thru ${metrics.medalist.holes} holes` : 'No individually-scored holes yet';
 
   const dogfightBody = metrics.dogfight ? escapeHtml(pairingLabel(metrics.dogfight.matchId, metrics.dogfight.evalr.pair)) : '—';
-  const dogfightSub = metrics.dogfight ? `${MATCH_META[metrics.dogfight.matchId].label} · ${pairingStatusLine(metrics.dogfight.evalr)}` : 'No matches underway yet';
+  const dogfightSub = metrics.dogfight ? `${sessionLabel(metrics.dogfight.matchId)} · ${pairingStatusLine(metrics.dogfight.evalr)}` : 'No matches underway yet';
 
   const hammerBody = metrics.hammer ? escapeHtml(pairingLabel(metrics.hammer.matchId, metrics.hammer.evalr.pair)) : '—';
-  const hammerSub = metrics.hammer ? `${MATCH_META[metrics.hammer.matchId].label} · ${pairingStatusLine(metrics.hammer.evalr)}` : 'No matches underway yet';
+  const hammerSub = metrics.hammer ? `${sessionLabel(metrics.hammer.matchId)} · ${pairingStatusLine(metrics.hammer.evalr)}` : 'No matches underway yet';
 
   const birdieBody = metrics.birdieKing ? escapeHtml(metrics.birdieKing.label) : '—';
   const birdieSub = metrics.birdieKing ? `${metrics.birdieKing.count} birdie${metrics.birdieKing.count>1?'s':''}/eagle${metrics.birdieKing.count>1?'s':''} this session` : 'No birdies or net eagles yet';
@@ -2353,7 +2778,7 @@ function renderRecapOverlay(){
       </div>
 
       <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-3">Session Match Breakdown</h2>
-      ${recapMatchBreakdown(sessionIds) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
+      ${recapMatchBreakdown(sessionIdList) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
 
       <div class="text-center text-[10px] text-[#5c6f61] mt-8 mb-4">Turtle Cup · Live recap — updates automatically as scores are entered</div>
     </div>
@@ -2435,6 +2860,121 @@ function renderAdminLoginModal(){
   </div>`;
 }
 
+// ---------------------------------------------------------
+// PIN keypad — isolated local buffer, zero full re-renders per keystroke
+// ---------------------------------------------------------
+// Deliberately NOT part of STATE: typing a digit must never trigger renderApp()'s full
+// innerHTML rebuild of the whole app. Digits live here and paint straight to the DOM.
+let tempPinBuffer = '';
+
+function pinDotsString(){
+  return Array.from({length:4}, (_,i) => i < tempPinBuffer.length ? '●' : '○').join('  ');
+}
+
+function paintPinDots(){
+  const el = document.getElementById('pinDotsDisplay');
+  if(el) el.textContent = pinDotsString();
+}
+
+function paintPinError(msg){
+  const el = document.getElementById('pinErrorText');
+  if(el) el.textContent = msg || '';
+}
+
+function shakePinModalCard(){
+  const card = document.getElementById('pinModalCard');
+  if(!card) return;
+  card.classList.remove('pin-shake');
+  void card.offsetWidth; // force reflow so a second rapid failure still restarts the animation
+  card.classList.add('pin-shake');
+}
+
+function resetPinModalClosed(){
+  STATE.ui.pinModal = { open:false, mode:null, playerId:'', context:{} };
+  tempPinBuffer = '';
+}
+
+function handlePinKeyTap(digit){
+  if(tempPinBuffer.length >= 4) return;
+  tempPinBuffer += digit;
+  paintPinDots();
+  if(tempPinBuffer.length < 4) return;
+
+  const m = STATE.ui.pinModal;
+  const player = playerById(m.playerId);
+  if(player && player.pin && tempPinBuffer === player.pin){
+    // Correct — commit the wager action with ONE real render (modal closes, Supabase push follows
+    // via the normal saveState() call already wired into renderApp()).
+    completePinAction(m);
+    return;
+  }
+  // Incorrect — shake + clear, entirely via direct DOM writes, no renderApp() at all.
+  paintPinError('Incorrect PIN');
+  shakePinModalCard();
+  setTimeout(() => {
+    tempPinBuffer = '';
+    paintPinDots();
+    paintPinError('');
+  }, 500);
+}
+
+function handlePinBackspace(){
+  tempPinBuffer = tempPinBuffer.slice(0, -1);
+  paintPinDots();
+  paintPinError('');
+}
+
+function handlePinClear(){
+  tempPinBuffer = '';
+  paintPinDots();
+  paintPinError('');
+}
+
+function renderPinModal(){
+  const m = STATE.ui.pinModal;
+  if(!(m && m.open)) return '';
+  const player = playerById(m.playerId);
+  const titleMap = {
+    propose: 'Confirm Wager', accept: 'Accept Wager', press: 'Call the Press',
+  };
+  const subMap = {
+    propose: 'Only the proposer can put their own name on the line.',
+    accept: 'Enter your PIN to lock in your side of this bet.',
+    press: 'Enter your PIN to call the press on behalf of your team.',
+  };
+
+  const candidates = (m.context && m.context.candidateIds) || [];
+  const candidateSelector = (m.mode==='press' && candidates.length>1) ? `
+    <select data-action="pin-player-select" class="w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs text-center mb-3 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
+      ${candidates.map(pid => `<option value="${pid}" ${pid===m.playerId?'selected':''}>${escapeHtml(displayName(playerById(pid)))}</option>`).join('')}
+    </select>` : '';
+
+  // Rendered once per modal open/mode-change only — per-keystroke updates go straight to
+  // #pinDotsDisplay/#pinErrorText via textContent, never back through here.
+  const keys = [1,2,3,4,5,6,7,8,9];
+
+  return `
+  <div class="fixed inset-0 z-[65] bg-black/80 flex items-center justify-center px-5 fade-in">
+    <div id="pinModalCard" class="w-full max-w-xs rounded-2xl border border-[#243527] p-5" style="background:#0f1712;">
+      <div class="text-center mb-1">
+        <div class="text-[11px] uppercase tracking-wide text-[#7f9689]">${titleMap[m.mode]||'Enter PIN'}</div>
+        <div class="font-display font-700 text-lg text-[#f5efe0] mt-0.5">${escapeHtml(displayName(player))}</div>
+        <p class="text-[10px] text-[#7f9689] mt-1">${subMap[m.mode]||''}</p>
+      </div>
+      ${candidateSelector}
+      <div id="pinDotsDisplay" class="text-center text-2xl tracking-widest font-display font-700 text-[#eef3ee] my-3">${pinDotsString()}</div>
+      <div id="pinErrorText" class="text-center text-[11px] text-[#f2a1ab] h-4 mb-1"></div>
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        ${keys.map(n=>`<button data-action="pin-key" data-key="${n}" class="h-12 rounded-lg bg-[#16241b] border border-[#243527] text-lg font-display font-600 text-[#eef3ee] active:scale-90 transition">${n}</button>`).join('')}
+        <button data-action="pin-clear" class="h-12 rounded-lg bg-[#16241b] border border-[#243527] text-[10px] font-semibold text-[#9db3a4] active:scale-90 transition">Clear</button>
+        <button data-action="pin-key" data-key="0" class="h-12 rounded-lg bg-[#16241b] border border-[#243527] text-lg font-display font-600 text-[#eef3ee] active:scale-90 transition">0</button>
+        <button data-action="pin-backspace" class="h-12 rounded-lg bg-[#16241b] border border-[#243527] text-lg text-[#9db3a4] active:scale-90 transition">⌫</button>
+      </div>
+      <button data-action="pin-cancel" class="w-full text-xs font-semibold py-2.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Cancel</button>
+    </div>
+  </div>`;
+}
+
 function renderApp(){
   // Safety net: a persisted/synced session could still have ui.tab==='admin' from before this
   // device locked (or from a different device's save) — never render admin content without auth.
@@ -2456,6 +2996,7 @@ function renderApp(){
     ${renderRecapOverlay()}
     ${renderConfirmModal()}
     ${renderAdminLoginModal()}
+    ${renderPinModal()}
   `;
 
   saveState();
@@ -2466,8 +3007,8 @@ function renderApp(){
    ========================================================= */
 function exportData(){
   const payload = {
-    app: 'turtle-cup-ryder', version: 4, exportedAt: new Date().toISOString(),
-    teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, matchCourse: STATE.matchCourse,
+    app: 'turtle-cup-ryder', version: 5, exportedAt: new Date().toISOString(),
+    teamNames: STATE.teamNames, roster: STATE.roster, courses: STATE.courses, sessions: STATE.sessions,
     lineups: STATE.lineups, scores: STATE.scores, admin: { passcode: STATE.admin.passcode },
     purseConfig: STATE.purseConfig, wagers: STATE.wagers, transactionLedger: STATE.transactionLedger,
   };
@@ -2491,15 +3032,17 @@ function randScore(par){
 }
 
 function fillDemoScores(){
-  Object.keys(MATCH_META).forEach(mid => {
+  sessionIds().forEach(mid => {
+    const session = sessionById(mid);
+    if(!session) return;
+    const fmt = formatMeta(session.format);
     const course = getCourseForMatch(mid);
+    const { start, count } = holeRange(session);
     (STATE.lineups[mid] || []).forEach(pair => {
       const entry = STATE.scores[mid][pair.id];
-      const count = mid==='m3' ? 9 : 18;
-      const start = mid==='m3' ? 9 : 0;
       for(let i=0;i<count;i++){
         const par = course.pars[start+i];
-        if(mid==='m1' || mid==='m2'){
+        if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
           entry.holes[i] = { a1:randScore(par), a2:randScore(par), b1:randScore(par), b2:randScore(par) };
         } else {
           entry.holes[i] = { a:randScore(par), b:randScore(par) };
@@ -2525,7 +3068,7 @@ root.addEventListener('click', (e) => {
     STATE.ui.tab = tabBtn.dataset.tab; renderApp(); return;
   }
 
-  for(const mid of Object.keys(MATCH_META)){
+  for(const mid of sessionIds()){
     const pBtn = e.target.closest(`[data-pairing-select-${mid}]`);
     if(pBtn){ STATE.ui.pairing[mid] = parseInt(pBtn.getAttribute(`data-pairing-select-${mid}`),10); renderApp(); return; }
   }
@@ -2571,7 +3114,7 @@ root.addEventListener('click', (e) => {
 
   } else if(act==='open-recap'){
     STATE.ui.recap.open = true;
-    if(!STATE.ui.recap.session) STATE.ui.recap.session = STATE.ui.tab in MATCH_META ? STATE.ui.tab : 'm1';
+    if(!STATE.ui.recap.session) STATE.ui.recap.session = sessionById(STATE.ui.tab) ? STATE.ui.tab : sessionIds()[0];
     renderApp();
 
   } else if(act==='close-recap'){
@@ -2632,7 +3175,7 @@ root.addEventListener('click', (e) => {
     const total = STATE.roster.red.length + STATE.roster.blue.length;
     if(total>=20) return;
     const id = 'p'+nextPlayerNum; nextPlayerNum++;
-    STATE.roster[side].push({ id, name:'New Player', nickname:'', hcp:15.0 });
+    STATE.roster[side].push({ id, name:'New Player', nickname:'', hcp:15.0, pin:'0000', wagerBalance:0, venmo:'', zelle:'', stats:baselinePlayerStats() });
     renderApp();
 
   } else if(act==='remove-player'){
@@ -2641,7 +3184,7 @@ root.addEventListener('click', (e) => {
     if(total<=8) return;
     STATE.roster[side] = STATE.roster[side].filter(p=>p.id!==pid);
     // strip this player from any lineup pairings and their scores
-    Object.keys(MATCH_META).forEach(mid => {
+    sessionIds().forEach(mid => {
       STATE.lineups[mid] = (STATE.lineups[mid]||[]).filter(pair => {
         const involved = mid==='m4' ? [pair.red,pair.blue] : [...pair.red, ...pair.blue];
         const hit = involved.includes(pid);
@@ -2651,12 +3194,40 @@ root.addEventListener('click', (e) => {
     });
     renderApp();
 
+  } else if(act==='add-session'){
+    addSession();
+    renderApp();
+
+  } else if(act==='move-session'){
+    moveSession(action.dataset.session, parseInt(action.dataset.dir,10));
+    renderApp();
+
+  } else if(act==='delete-session'){
+    if(STATE.sessions.length<=1) return;
+    const sid = action.dataset.session;
+    const session = sessionById(sid);
+    const pairCount = (STATE.lineups[sid]||[]).length;
+    const warning = pairCount
+      ? `Delete "${session ? session.sessionName : sid}"? This removes its ${pairCount} pairing${pairCount===1?'':'s'}, all its scores, and any wagers tied to it. This cannot be undone.`
+      : `Delete "${session ? session.sessionName : sid}"?`;
+    if(!confirm(warning)) return;
+    deleteSession(sid);
+    renderApp();
+
+  } else if(act==='session-field' && action.dataset.field==='holesToPlay'){
+    const session = sessionById(action.dataset.session);
+    if(!session) return;
+    changeSessionHoleCount(session, parseInt(action.dataset.value,10)===9 ? 9 : 18);
+    renderApp();
+
   } else if(act==='add-pairing'){
     const mid = action.dataset.match;
+    const session = sessionById(mid);
+    if(!session) return;
     const draft = STATE.ui.draft[mid];
     const id = 'pair'+nextPairNum;
     let pair;
-    if(mid==='m4'){
+    if(formatMeta(session.format).playersPerSide===1){
       if(!draft.r || !draft.b) { alert('Choose one Red and one Blue player.'); return; }
       pair = { id, red:draft.r, blue:draft.b };
       STATE.ui.draft[mid] = { r:'', b:'' };
@@ -2667,7 +3238,7 @@ root.addEventListener('click', (e) => {
     }
     nextPairNum++;
     STATE.lineups[mid].push(pair);
-    STATE.scores[mid][id] = { holes: emptyHoles(mid), finalized: false };
+    STATE.scores[mid][id] = { holes: emptyHoles(session), finalized: false };
     renderApp();
 
   } else if(act==='remove-pairing'){
@@ -2690,7 +3261,7 @@ root.addEventListener('click', (e) => {
   } else if(act==='remove-course'){
     const cid = action.dataset.course;
     if(STATE.courses.length<=1) return;
-    if(Object.values(STATE.matchCourse).includes(cid)) return; // guard even if button state is stale
+    if(STATE.sessions.some(s=>s.courseId===cid)) return; // guard even if button state is stale
     if(!confirm('Remove this course from the database?')) return;
     STATE.courses = STATE.courses.filter(c=>c.id!==cid);
     delete STATE.ui.courseEditorOpen[cid];
@@ -2756,13 +3327,15 @@ root.addEventListener('click', (e) => {
     const sessionId = action.dataset.match, pairingId = action.dataset.pairing;
     const parentSegment = action.dataset.segment, startHole = parseInt(action.dataset.hole,10);
     const pressingSide = action.dataset.side;
-    STATE.wagers.push({
-      wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PRESS, status:WAGER_STATUS.ACCEPTED, createdAt:Date.now(),
-      sessionId, matchId:pairingId, segment: pressSegmentLabel(sessionId, parentSegment, startHole),
-      creatorId:null, acceptorId:null, targetTeam: pressingSide.toUpperCase(),
-      amount: STATE.purseConfig.defaultPressAmount || 20, winnerId:null, settledAt:null,
-      parentSegment, startHoleIndex:startHole, propKind:null, label:'', creatorPick:'', acceptorPick:'',
-    });
+    const pair = (STATE.lineups[sessionId]||[]).find(p=>p.id===pairingId);
+    if(!pair) return;
+    const raw = pair[pressingSide];
+    const candidateIds = Array.isArray(raw) ? raw : [raw];
+    STATE.ui.pinModal = {
+      open:true, mode:'press', playerId:candidateIds[0],
+      context:{ sessionId, pairingId, parentSegment, startHoleIndex:startHole, pressingSide, candidateIds },
+    };
+    tempPinBuffer = '';
     renderApp();
 
   } else if(act==='wager-kind-select'){
@@ -2775,18 +3348,10 @@ root.addEventListener('click', (e) => {
     const amount = Math.max(1, round2(parseFloat(amountEl ? amountEl.value : '10') || 10));
     if(!d.proposerId || !d.opponentId){ alert('Choose a proposer and an opponent.'); return; }
     if(d.proposerId === d.opponentId){ alert('Proposer and opponent must be different players.'); return; }
-
+    let label = '';
     if(d.kind==='match'){
       if(!d.matchId || !d.pairingId || !d.segment){ alert('Choose a match, pairing, and segment.'); return; }
-      STATE.wagers.push({
-        wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.MATCH_SEGMENT, status:WAGER_STATUS.OPEN, createdAt:Date.now(),
-        sessionId:d.matchId, matchId:d.pairingId, segment:segToEnum(d.segment),
-        creatorId:d.proposerId, acceptorId:d.opponentId, targetTeam:d.side.toUpperCase(), amount,
-        winnerId:null, settledAt:null, propKind:null, label:'', creatorPick:'', acceptorPick:'',
-      });
-      STATE.ui.wagerDraft = { ...d, matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'' };
     } else {
-      let label = '';
       if(d.propKind==='custom'){
         const labelEl = document.getElementById('wagerLabelInput');
         label = labelEl ? labelEl.value.trim() : '';
@@ -2794,31 +3359,30 @@ root.addEventListener('click', (e) => {
       } else if(d.propKind!=='champion' && (!d.proposerPick || !d.opponentPick)){
         alert('Both players need to make a pick.'); return;
       }
-      STATE.wagers.push({
-        wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PROP,
-        status:WAGER_STATUS.OPEN, createdAt:Date.now(), sessionId:null, matchId:null, segment:null,
-        creatorId:d.proposerId, acceptorId:d.opponentId,
-        amount, winnerId:null, settledAt:null,
-        propKind: d.propKind, label,
-        creatorPick: d.propKind==='champion' ? (d.proposerPick||'red') : d.proposerPick,
-        acceptorPick: d.propKind==='champion' ? '' : d.opponentPick,
-      });
-      STATE.ui.wagerDraft = { ...d, proposerId:'', opponentId:'', proposerPick:'', opponentPick:'' };
     }
+    // Stash the validated form data (including anything read from a DOM input) — the PIN modal is
+    // about to replace this form entirely, so createWagerFromDraft() can't re-read those fields later.
+    STATE.ui.wagerDraft._pendingAmount = amount;
+    STATE.ui.wagerDraft._pendingLabel = label;
+    STATE.ui.pinModal = { open:true, mode:'propose', playerId:d.proposerId, context:{} };
+    tempPinBuffer = '';
     renderApp();
 
   } else if(act==='accept-wager'){
     const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
-    if(w && w.status===WAGER_STATUS.OPEN){ w.status=WAGER_STATUS.ACCEPTED; renderApp(); }
+    if(!w || w.status!==WAGER_STATUS.PENDING) return;
+    STATE.ui.pinModal = { open:true, mode:'accept', playerId:w.acceptorId, context:{ wagerId:w.wagerId } };
+    tempPinBuffer = '';
+    renderApp();
 
   } else if(act==='decline-wager'){
     const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
-    if(w && w.status===WAGER_STATUS.OPEN){ w.status=WAGER_STATUS.DECLINED; w.settledAt=Date.now(); renderApp(); }
+    if(w && w.status===WAGER_STATUS.PENDING){ w.status=WAGER_STATUS.DECLINED; w.settledAt=Date.now(); renderApp(); }
 
   } else if(act==='settle-prop'){
     if(!adminAuthenticated){ alert('Enable Admin Mode to manually settle a prop bet.'); return; }
     const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
-    if(!w || w.status!==WAGER_STATUS.ACCEPTED) return;
+    if(!w || w.status!==WAGER_STATUS.ACTIVE) return;
     const winner = action.dataset.winner;
     if(winner==='push'){
       w.status=WAGER_STATUS.PUSHED; w.winnerId=null; w.settledAt=Date.now();
@@ -2833,6 +3397,80 @@ root.addEventListener('click', (e) => {
       w.status=WAGER_STATUS.SETTLED; w.winnerId=winnerId; w.settledAt=Date.now();
     }
     renderApp();
+
+  } else if(act==='pin-key'){
+    handlePinKeyTap(action.dataset.key); // direct DOM paint only — no renderApp() unless the 4th digit is correct
+
+  } else if(act==='pin-backspace'){
+    handlePinBackspace();
+
+  } else if(act==='pin-clear'){
+    handlePinClear();
+
+  } else if(act==='pin-cancel'){
+    resetPinModalClosed();
+    renderApp();
+    flushQueuedRemoteStateIfPossible();
+
+  } else if(act==='dispute-force-accept'){
+    if(!adminAuthenticated) return;
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(w && w.status===WAGER_STATUS.PENDING) w.status = WAGER_STATUS.ACTIVE;
+    renderApp();
+
+  } else if(act==='dispute-void'){
+    if(!adminAuthenticated) return;
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(!w) return;
+    if(!confirm('Void this wager? No money will move for it, and this cannot be undone.')) return;
+    w.status = WAGER_STATUS.VOID;
+    w.settledAt = Date.now();
+    renderApp();
+
+  } else if(act==='dispute-save-amount'){
+    if(!adminAuthenticated) return;
+    const wagerId = action.dataset.wager;
+    const input = document.querySelector(`[data-action="dispute-amount-input"][data-wager="${wagerId}"]`);
+    const val = input ? Math.max(1, round2(parseFloat(input.value) || 0)) : 0;
+    if(!val) return;
+    const w = STATE.wagers.find(x=>x.wagerId===wagerId);
+    if(w) w.amount = val;
+    renderApp();
+
+  } else if(act==='save-single-pin'){
+    if(!adminAuthenticated) return;
+    const side = action.dataset.side, playerId = action.dataset.player;
+    const input = document.getElementById('pinRow_'+playerId);
+    if(!input) return;
+    const clean = input.value.replace(/[^0-9]/g,'').slice(0,4);
+    if(clean.length!==4){ alert('PIN must be exactly 4 digits.'); return; }
+    const p = STATE.roster[side].find(pl=>pl.id===playerId);
+    if(p) p.pin = clean;
+    renderApp();
+
+  } else if(act==='generate-random-pins'){
+    if(!adminAuthenticated) return;
+    const filled = generateRandomPinsForEmpty();
+    renderApp();
+    if(filled===0) alert('Every player already has a PIN set — nothing to generate. Use "Set All Default" to overwrite existing PINs.');
+
+  } else if(act==='reset-default-pins'){
+    if(!adminAuthenticated) return;
+    if(!confirm('Reset EVERY player\'s PIN to 0000? This overwrites any personalized PINs already set.')) return;
+    allPlayersFlat().forEach(p => { p.pin = '0000'; });
+    renderApp();
+
+  } else if(act==='copy-pin-list'){
+    if(!adminAuthenticated) return;
+    const text = buildPinListText();
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(
+        () => { action.textContent = '✓ Copied'; setTimeout(()=>renderApp(), 1200); },
+        () => alert(text)
+      );
+    } else {
+      alert(text);
+    }
 
   } else if(act==='copy-settlement'){
     const text = action.dataset.text || '';
@@ -2886,6 +3524,9 @@ root.addEventListener('change', (e) => {
     } else if(field==='pzelle'){
       const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
       if(p) p.zelle = el.value.trim();
+    } else if(field==='ppin'){
+      const p = STATE.roster[el.dataset.side].find(pl=>pl.id===el.dataset.player);
+      if(p) p.pin = el.value.replace(/[^0-9]/g,'').slice(0,4);
     }
     renderApp();
 
@@ -2907,14 +3548,26 @@ root.addEventListener('change', (e) => {
     if(field==='propKind'){ STATE.ui.wagerDraft.proposerPick=''; STATE.ui.wagerDraft.opponentPick=''; }
     renderApp();
 
+  } else if(e.target.matches('[data-action="pin-player-select"]')){
+    STATE.ui.pinModal.playerId = e.target.value;
+    tempPinBuffer = '';
+    renderApp();
+
   } else if(e.target.matches('[data-action="draft-select"]')){
     const mid = e.target.dataset.match, field = e.target.dataset.field;
     STATE.ui.draft[mid][field] = e.target.value;
     renderApp();
 
-  } else if(e.target.matches('[data-action="course-select"]')){
-    const mid = e.target.dataset.match;
-    STATE.matchCourse[mid] = e.target.value;
+  } else if(e.target.matches('[data-action="session-field"]')){
+    const sid = e.target.dataset.session, field = e.target.dataset.field;
+    const session = sessionById(sid);
+    if(!session) return;
+    if(field==='sessionName') session.sessionName = e.target.value || session.sessionId;
+    else if(field==='date') session.date = e.target.value;
+    else if(field==='timeOfDay') session.timeOfDay = e.target.value;
+    else if(field==='courseId') session.courseId = e.target.value;
+    else if(field==='format') session.format = FORMAT_META[e.target.value] ? e.target.value : session.format;
+    else if(field==='holesToPlay') changeSessionHoleCount(session, parseInt(e.target.value,10)===9 ? 9 : 18);
     renderApp();
 
   } else if(e.target.matches('.course-field')){
@@ -2940,12 +3593,12 @@ root.addEventListener('change', (e) => {
         STATE.teamNames = parsed.teamNames || STATE.teamNames;
         STATE.roster = ensurePlayerMoneyFields(parsed.roster);
         STATE.courses = parsed.courses || baselineCourses();
-        STATE.matchCourse = parsed.matchCourse || baselineMatchCourse();
+        STATE.sessions = ensureSessionsField(parsed);
         STATE.lineups = parsed.lineups;
         STATE.scores = ensureScoreEntryFields(parsed.scores);
         STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
         STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
-        STATE.wagers = parsed.wagers || [];
+        STATE.wagers = migrateWagerStatuses(parsed.wagers || []);
         STATE.transactionLedger = parsed.transactionLedger || [];
         recalcCounters();
         renderApp();
