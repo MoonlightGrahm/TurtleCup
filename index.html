@@ -551,6 +551,11 @@ let queuedRemoteState = null;
 function isUserTypingInField(){
   const el = document.activeElement;
   if(!el) return false;
+  // The admin passcode field doesn't write anything into STATE as you type — it's purely compared
+  // against STATE.admin.passcode on submit. Deferring sync while it's focused doesn't protect any
+  // in-progress edit here; it just risks comparing against a stale local passcode instead of the
+  // real synced one, which is exactly backwards for a login field.
+  if(el.id === 'adminPasscodeInput') return false;
   const tag = el.tagName;
   return tag==='INPUT' || tag==='TEXTAREA' || tag==='SELECT';
 }
@@ -3063,6 +3068,7 @@ root.addEventListener('click', (e) => {
     if(tabBtn.dataset.tab==='admin' && !adminAuthenticated){
       STATE.ui.modal = { open:true, type:'admin-login' };
       renderApp();
+      flushQueuedRemoteStateIfPossible(); // never gate a passcode check on stale, deferred sync data
       return;
     }
     STATE.ui.tab = tabBtn.dataset.tab; renderApp(); return;
