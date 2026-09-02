@@ -723,6 +723,10 @@ async function connectSupabase(url, anonKey, { silent } = {}){
     cloudStatus = 'connected'; cloudError = '';
     saveSupabaseConfig({ url, anonKey });
     renderApp();
+    // renderApp() -> saveState() always schedules a debounced push as a matter of course, but we
+    // just confirmed STATE and the server agree (we either seeded it or adopted its data moments
+    // ago) — that scheduled push would be a pointless duplicate write. Cancel it.
+    clearTimeout(cloudSyncTimer);
     return true;
   } catch(e){
     supabaseClient = null;
