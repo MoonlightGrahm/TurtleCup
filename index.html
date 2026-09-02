@@ -677,6 +677,24 @@ function subscribeRealtime(){
     });
 }
 
+// Pulls whatever's currently in the DB and applies it locally — never pushes. This exists
+// specifically so a device that's been asleep/backgrounded (stale in-memory STATE, dropped
+// realtime WebSocket) gets refreshed with the truth BEFORE anything it does can push its stale
+// snapshot over the top of newer data from another device. Safe to call anytime; failures are
+// silent since the realtime subscription and the next successful push will reconcile regardless.
+async function pullFreshRemoteState(){
+  if(!supabaseClient){ renderApp(); return; }
+  try{
+    const { data, error } = await supabaseClient.from(CLOUD_TABLE).select('data').eq('id', CLOUD_ROW_ID).maybeSingle();
+    if(error) throw error;
+    if(data && data.data) applyRemoteState(data.data); // renders internally, and — thanks to the
+      // applyingRemoteUpdate guard — does NOT trigger a push back up as a side effect.
+    else renderApp();
+  } catch(e){
+    renderApp(); // still reflect current connectivity status even if the refresh itself failed
+  }
+}
+
 async function connectSupabase(url, anonKey, { silent } = {}){
   if(!url || !anonKey){
     if(!silent) alert('Enter both the Supabase URL and anon key first.');
@@ -3634,10 +3652,24 @@ if(savedCloudConfig && savedCloudConfig.url && savedCloudConfig.anonKey){
 }
 
 window.addEventListener('online', () => {
-  renderApp();
-  if(outboxPending && supabaseClient) pushCloudState(true);
+  // Pull fresh state FIRST — regaining connectivity is exactly the moment this device's cached
+  // STATE is most likely stale relative to what other devices have pushed while it was offline.
+  pullFreshRemoteState().then(() => {
+    if(outboxPending && supabaseClient) pushCloudState(true);
+  });
 });
 window.addEventListener('offline', renderApp);
+
+// The realtime WebSocket subscription commonly gets suspended or dropped while a mobile tab is
+// backgrounded/the screen is locked — reconnecting doesn't retroactively deliver whatever changed
+// while it was disconnected. Refresh from the DB the moment the tab becomes visible again, before
+// any local interaction gets a chance to push this device's now-stale in-memory STATE over the top
+// of newer data from another device (this was the exact "phone clobbers computer" bug).
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && supabaseClient){
+    pullFreshRemoteState();
+  }
+});
 </script>
 </body>
 </html>
