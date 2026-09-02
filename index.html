@@ -182,7 +182,7 @@ function moveSession(sessionId, direction){
 }
 
 // ---- Real-money wager / ledger schema enums ----------------------------
-const WAGER_TYPE = { MATCH_SEGMENT:'MATCH_SEGMENT', PRESS:'PRESS', PROP:'PROP' };
+const WAGER_TYPE = { MATCH_SEGMENT:'MATCH_SEGMENT', PRESS:'PRESS', PROP:'PROP', SKINS:'SKINS' };
 const WAGER_STATUS = { PENDING:'PENDING', ACTIVE:'ACTIVE', DECLINED:'DECLINED', SETTLED:'SETTLED', PUSHED:'PUSHED', VOID:'VOID' };
 const SEGMENT_ENUM = { FRONT_9:'FRONT_9', BACK_9:'BACK_9', OVERALL:'OVERALL' };
 const TX_TYPE = { WAGER_WIN:'WAGER_WIN', WAGER_LOSS:'WAGER_LOSS' };
@@ -296,6 +296,26 @@ function migrateWagerStatuses(wagers){
   return wagers;
 }
 
+// [FR-LEDGER-007] Legacy wager payloads (MATCH_SEGMENT/PRESS/PROP, saved before the Skins Pool
+// feature existed) never had `participants`/`holeIndex`, and in principle `wagerType` itself could
+// be missing on very old/malformed rows. Any code that now generically reads these fields off any
+// wager (e.g. rendering a mixed list in Wager Central) must never see `undefined` — backfill on
+// every load path (local cache, Supabase realtime, and file import) rather than special-casing
+// SKINS everywhere it's read.
+function migrateWagerShape(wagers){
+  (wagers||[]).forEach(w => {
+    if(!w.wagerType) w.wagerType = WAGER_TYPE.PROP; // safest generic fallback for a truly unknown legacy shape
+    if(!Array.isArray(w.participants)){
+      // Old 1v1-style wagers (MATCH_SEGMENT/PROP) had exactly a creator+acceptor; anonymous
+      // team-level PRESS wagers had neither — both cases derive a sane participants list.
+      w.participants = [w.creatorId, w.acceptorId].filter(Boolean);
+    }
+    if(typeof w.holeIndex !== 'number') w.holeIndex = null;
+    if(w.wagerType===WAGER_TYPE.SKINS && !w.skinType) w.skinType = 'low_score';
+  });
+  return wagers;
+}
+
 // Fresh saves from before the dynamic schedule engine have no `sessions` array (and courses were
 // assigned via the old flat `matchCourse` map) — rebuild the 4 fixed matches as real sessions so
 // existing lineups/scores (already keyed m1..m4) line up with zero data movement.
@@ -339,7 +359,8 @@ function defaultState(){
   return {
     ui: { tab:'m1', pairing:uiDefaults.pairing, hole:uiDefaults.hole, draft:uiDefaults.draft, courseEditorOpen:{}, recap:{ open:false, session:'m1' }, modal:{ open:false, type:null },
       pinModal: { open:false, mode:null, playerId:'', context:{} },
-      wagerDraft: { kind:'match', matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', side:'red', propKind:'medalist', proposerPick:'', opponentPick:'' } },
+      wagerDraft: { kind:'match', matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', side:'red', propKind:'medalist', proposerPick:'', opponentPick:'',
+        skinsSessionId:'', skinsHoleIndex:'', skinType:'low_score', skinsParticipants:[] } },
     admin: { passcode: DEFAULT_ADMIN_PASSCODE },
     teamNames: { red:'Team Red', blue:'Team Blue' },
     roster: baselineRoster(),
@@ -433,7 +454,7 @@ function loadState(){
     STATE.scores = ensureScoreEntryFields(parsed.scores);
     STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
-    STATE.wagers = migrateWagerStatuses(parsed.wagers || []);
+    STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
     STATE.transactionLedger = parsed.transactionLedger || [];
     if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
     lastSavedAt = parsed.savedAt || Date.now();
@@ -599,7 +620,7 @@ function applyRemoteState(data){
     STATE.scores = ensureScoreEntryFields(data.scores || STATE.scores);
     STATE.admin = { passcode: (data.admin && data.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
     STATE.purseConfig = { ...defaultPurseConfig(), ...(data.purseConfig||{}) };
-    STATE.wagers = migrateWagerStatuses(data.wagers || []);
+    STATE.wagers = migrateWagerShape(migrateWagerStatuses(data.wagers || []));
     STATE.transactionLedger = data.transactionLedger || [];
     recalcCounters();
     renderApp();
@@ -1066,9 +1087,10 @@ function createWagerFromDraft(){
       sessionId:d.matchId, matchId:d.pairingId, segment:segToEnum(d.segment),
       creatorId:d.proposerId, acceptorId:d.opponentId, targetTeam:d.side.toUpperCase(), amount,
       winnerId:null, settledAt:null, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+      participants:[d.proposerId, d.opponentId], holeIndex:null, skinType:null,
     });
     STATE.ui.wagerDraft = { ...d, matchId:'', pairingId:'', segment:'', proposerId:'', opponentId:'', _pendingAmount:undefined };
-  } else {
+  } else if(d.kind==='prop'){
     STATE.wagers.push({
       wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.PROP,
       status:WAGER_STATUS.PENDING, createdAt:Date.now(), sessionId:null, matchId:null, segment:null,
@@ -1077,6 +1099,7 @@ function createWagerFromDraft(){
       propKind: d.propKind, label: d._pendingLabel || '',
       creatorPick: d.propKind==='champion' ? (d.proposerPick||'red') : d.proposerPick,
       acceptorPick: d.propKind==='champion' ? '' : d.opponentPick,
+      participants:[d.proposerId, d.opponentId], holeIndex:null, skinType:null,
     });
     STATE.ui.wagerDraft = { ...d, proposerId:'', opponentId:'', proposerPick:'', opponentPick:'', _pendingAmount:undefined, _pendingLabel:undefined };
   }
@@ -1090,7 +1113,52 @@ function createPressWager(context, initiatingPlayerId){
     creatorId: initiatingPlayerId, acceptorId:null, targetTeam: pressingSide.toUpperCase(),
     amount: STATE.purseConfig.defaultPressAmount || 20, winnerId:null, settledAt:null,
     parentSegment, startHoleIndex, propKind:null, label:'', creatorPick:'', acceptorPick:'',
+    participants:[], holeIndex:null, skinType:null,
   });
+}
+
+// [FR-LEDGER-007] Skins/Greenie pool: multiple players buy in on one specific hole, one winner takes
+// the pot. Like a Press, this goes ACTIVE immediately on a single creator PIN — with everyone
+// physically on the tee together, a sequential per-participant accept flow adds friction without
+// adding real protection, and it keeps this consistent with the app's one existing multi-party
+// wager pattern rather than inventing a second one.
+function createSkinsWager(context, creatorId){
+  const { sessionId, holeIndex, skinType, participantIds, amountPerPlayer } = context;
+  STATE.wagers.push({
+    wagerId:'wager'+(nextWagerNum++), wagerType:WAGER_TYPE.SKINS, status:WAGER_STATUS.ACTIVE, createdAt:Date.now(),
+    sessionId, matchId:null, segment:null, holeIndex, skinType,
+    creatorId, acceptorId:null, targetTeam:null, amount:amountPerPlayer, winnerId:null, settledAt:null,
+    participants: participantIds.slice(),
+    propKind:null, label:'', creatorPick:'', acceptorPick:'', parentSegment:null, startHoleIndex:null,
+  });
+}
+
+// [FR-LEDGER-007] Finds one player's individual gross score on a specific hole within a session,
+// regardless of which pairing they're in or which side of it (red/blue, player 1/2). Only
+// resolvable for perPlayer-shaped formats (Better Ball, Singles) — team-score formats (Pinehurst/
+// Alt-Shot/Scramble) only ever record one combined score per side, so there's no individual score
+// to attribute to a specific participant; returns null in that case, same as "not yet entered".
+function findPlayerGrossScoreOnHole(sessionId, playerId, holeIndex){
+  const session = sessionById(sessionId);
+  if(!session) return null;
+  const fmt = formatMeta(session.format);
+  if(fmt.scoreShape !== 'perPlayer') return null;
+  const pairs = STATE.lineups[sessionId] || [];
+  for(const pair of pairs){
+    const scoreEntry = STATE.scores[sessionId] && STATE.scores[sessionId][pair.id];
+    if(!scoreEntry || !scoreEntry.holes[holeIndex]) continue;
+    const h = scoreEntry.holes[holeIndex];
+    if(fmt.playersPerSide===1){
+      if(pair.red===playerId) return h.a===''?null:h.a;
+      if(pair.blue===playerId) return h.b===''?null:h.b;
+    } else {
+      if(pair.red[0]===playerId) return h.a1===''?null:h.a1;
+      if(pair.red[1]===playerId) return h.a2===''?null:h.a2;
+      if(pair.blue[0]===playerId) return h.b1===''?null:h.b1;
+      if(pair.blue[1]===playerId) return h.b2===''?null:h.b2;
+    }
+  }
+  return null; // participant isn't paired into this session at all
 }
 
 // Dispatches on the PIN modal's `mode` once the entered PIN matches the target player's — this is
@@ -1103,6 +1171,11 @@ function completePinAction(m){
     if(w && w.status===WAGER_STATUS.PENDING) w.status = WAGER_STATUS.ACTIVE;
   } else if(m.mode==='press'){
     createPressWager(m.context, m.playerId);
+  } else if(m.mode==='skins'){
+    createSkinsWager(m.context, m.playerId);
+    STATE.ui.wagerDraft.skinsSessionId = '';
+    STATE.ui.wagerDraft.skinsHoleIndex = '';
+    STATE.ui.wagerDraft.skinsParticipants = [];
   }
   resetPinModalClosed();
   renderApp(); // single render: closes the modal, mounts the new wager, and (via saveState) pushes to Supabase
@@ -1183,6 +1256,40 @@ function settleWagersForPairing(sessionId, pairingId){
 function settleAllWagers(){
   sessionIds().forEach(mid => {
     allPairingIds(mid).forEach(pid => settleWagersForPairing(mid, pid));
+  });
+  settleSkinsWagers();
+}
+
+// [FR-LEDGER-007] Skins pools aren't tied to a single pairing finishing (they can span every
+// pairing in a session), so — like PROP wagers — they aren't settled from settleWagersForPairing().
+// `closest_to_pin` pools have no distance data to auto-derive a winner from and are always settled
+// manually by an admin (Wager Dispute panel); only `low_score` auto-settles here.
+function settleSkinsWagers(){
+  STATE.wagers.forEach(w => {
+    if(w.wagerType!==WAGER_TYPE.SKINS || w.status!==WAGER_STATUS.ACTIVE) return;
+    if(w.skinType!=='low_score') return;
+
+    const entries = w.participants.map(pid => ({ pid, gross: findPlayerGrossScoreOnHole(w.sessionId, pid, w.holeIndex) }));
+    if(entries.some(e => e.gross==null)) return; // still waiting on at least one participant's score
+
+    const min = Math.min(...entries.map(e => e.gross));
+    const winners = entries.filter(e => e.gross===min);
+    const holeLabel = `Hole ${w.holeIndex+1} — ${sessionLabel(w.sessionId)}`;
+
+    if(winners.length > 1){
+      w.status = WAGER_STATUS.PUSHED; w.winnerId = null; w.settledAt = Date.now();
+      return;
+    }
+    const winnerId = winners[0].pid;
+    const potTotal = round2(w.amount * w.participants.length);
+    const netGain = round2(potTotal - w.amount); // winner's contribution was already part of the pot they're taking
+    applyWagerLedger(winnerId, netGain, TX_TYPE.WAGER_WIN, `Won the Skins pool (${fmtMoney(potTotal)} pot) — ${holeLabel}`);
+    w.participants.filter(pid => pid!==winnerId).forEach(pid => {
+      applyWagerLedger(pid, -w.amount, TX_TYPE.WAGER_LOSS, `Lost the Skins pool — ${holeLabel}`);
+      const ls = playerStats(pid); if(ls) ls.wagersLost += 1;
+    });
+    const ws = playerStats(winnerId); if(ws) ws.wagersWon += 1;
+    w.status = WAGER_STATUS.SETTLED; w.winnerId = winnerId; w.settledAt = Date.now();
   });
 }
 
@@ -2148,11 +2255,13 @@ function renderWagerProposeForm(){
   const matchOptions = sessionIds().filter(mid => (STATE.lineups[mid]||[]).length>0);
   const selectCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
 
-  const kindTabs = ['match','prop'].map(k => `
-    <button data-action="wager-kind-select" data-kind="${k}" class="flex-1 text-xs font-semibold py-2 rounded-lg border transition ${d.kind===k?'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]':'bg-[#111c15] text-[#9db3a4] border-[#243527]'}">${k==='match'?'Match Wager':'Prop Bet'}</button>
+  const kindTabs = ['match','prop','skins'].map(k => `
+    <button data-action="wager-kind-select" data-kind="${k}" class="flex-1 text-xs font-semibold py-2 rounded-lg border transition ${d.kind===k?'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]':'bg-[#111c15] text-[#9db3a4] border-[#243527]'}">${k==='match'?'Match Wager':k==='prop'?'Prop Bet':'Skins Pool'}</button>
   `).join('');
 
   let fields = '';
+  let footer = '';
+
   if(d.kind==='match'){
     const pairs = d.matchId ? (STATE.lineups[d.matchId]||[]) : [];
     const segOptions = ['front9','back9','overall'].map(key => ({ key, label: d.matchId ? segLabel(d.matchId, key) : key }));
@@ -2190,7 +2299,15 @@ function renderWagerProposeForm(){
         </select>
       </div>
     </div>`;
-  } else {
+    footer = `
+    <div class="flex items-center gap-2 mt-3">
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">Stake $</span>
+      <input id="wagerAmountInput" type="number" min="1" step="5" value="10" class="w-20 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">each</span>
+      <button data-action="propose-wager" class="ml-auto text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Propose</button>
+    </div>`;
+
+  } else if(d.kind==='prop'){
     const propOptions = [
       { v:'medalist', l:'Low Net Medalist' },
       { v:'birdieKing', l:'Birdie King' },
@@ -2239,18 +2356,62 @@ function renderWagerProposeForm(){
         </select>
       </div>
     </div>`;
+    footer = `
+    <div class="flex items-center gap-2 mt-3">
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">Stake $</span>
+      <input id="wagerAmountInput" type="number" min="1" step="5" value="10" class="w-20 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">each</span>
+      <button data-action="propose-wager" class="ml-auto text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Propose</button>
+    </div>`;
+
+  } else { // 'skins' — [FR-LEDGER-007] hole pool
+    const session = d.skinsSessionId ? sessionById(d.skinsSessionId) : null;
+    const holeOptions = session ? Array.from({length:session.holesToPlay}, (_,i)=>i) : [];
+    const notTeamScoreSessions = sessionIds().filter(mid => {
+      const s = sessionById(mid);
+      return s && (STATE.lineups[mid]||[]).length>0;
+    });
+    const all = allPlayersFlat();
+    fields = `
+    <div class="space-y-2 mt-2">
+      <select data-action="wager-draft-select" data-field="skinsSessionId" class="${selectCls}">
+        <option value="">Choose match…</option>
+        ${notTeamScoreSessions.map(mid=>`<option value="${mid}" ${d.skinsSessionId===mid?'selected':''}>${sessionLabel(mid)}</option>`).join('')}
+      </select>
+      ${session ? `
+      <select data-action="wager-draft-select" data-field="skinsHoleIndex" class="${selectCls}">
+        <option value="">Choose hole…</option>
+        ${holeOptions.map(i=>`<option value="${i}" ${String(d.skinsHoleIndex)===String(i)?'selected':''}>Hole ${i+1}</option>`).join('')}
+      </select>` : ''}
+      <select data-action="wager-draft-select" data-field="skinType" class="${selectCls}">
+        <option value="low_score" ${d.skinType==='low_score'?'selected':''}>Low Score (auto-settles from scorecards)</option>
+        <option value="closest_to_pin" ${d.skinType==='closest_to_pin'?'selected':''}>Closest to Pin (admin declares winner)</option>
+      </select>
+      ${session && formatMeta(session.format).scoreShape!=='perPlayer' && d.skinType==='low_score' ? `
+      <p class="text-[10px] text-[#f2a1ab]">${escapeHtml(session.sessionName)} is a team-score format (${escapeHtml(formatMeta(session.format).label)}) — there's no individual score to compare per hole, so a Low Score pool here will never auto-settle. Use Closest to Pin instead, or pick a Better Ball / Singles match.</p>` : ''}
+      <div class="rounded-lg border border-[#24352a] bg-[#0e1712] p-2 max-h-36 overflow-y-auto">
+        <div class="text-[10px] text-[#7f9689] mb-1">Participants (${d.skinsParticipants.length} selected)</div>
+        ${all.map(p => `
+          <label class="flex items-center gap-2 py-1 text-xs cursor-pointer">
+            <input type="checkbox" data-action="skins-participant-toggle" data-player="${p.id}" ${d.skinsParticipants.includes(p.id)?'checked':''} class="accent-[#3fae6a]" />
+            ${escapeHtml(displayName(p))}
+          </label>`).join('')}
+      </div>
+    </div>`;
+    footer = `
+    <div class="flex items-center gap-2 mt-3">
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">Buy-in $</span>
+      <input id="wagerAmountInput" type="number" min="1" step="5" value="10" class="w-20 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
+      <span class="text-[11px] text-[#7f9689] flex-shrink-0">per player${d.skinsParticipants.length ? ` · ${d.skinsParticipants.length} in the pool` : ''}</span>
+      <button data-action="propose-wager" class="ml-auto text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Start Pool</button>
+    </div>`;
   }
 
   return `
   <div class="mx-4 mb-4 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
     <div class="flex gap-2">${kindTabs}</div>
     ${fields}
-    <div class="flex items-center gap-2 mt-3">
-      <span class="text-[11px] text-[#7f9689] flex-shrink-0">Stake $</span>
-      <input id="wagerAmountInput" type="number" min="1" step="5" value="10" class="w-20 bg-[#0e1712] border border-[#24352a] rounded-lg px-2 py-2 text-xs text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
-      <span class="text-[11px] text-[#7f9689] flex-shrink-0">each</span>
-      <button data-action="propose-wager" class="ml-auto text-xs font-semibold px-4 py-2 rounded-lg bg-[#3fae6a] text-[#0a100c] active:scale-95 transition">Propose</button>
-    </div>
+    ${footer}
   </div>`;
 }
 
@@ -2280,6 +2441,12 @@ function wagerCardDescription(w){
     const byWhom = w.creatorId ? ` · called by ${escapeHtml(displayName(playerById(w.creatorId)))}` : '';
     return `Press by ${escapeHtml(team)}${byWhom} · ${sessionLabel(w.sessionId)} · ${escapeHtml(matchupText)} · ${w.segment}`;
   }
+  if(w.wagerType===WAGER_TYPE.SKINS){
+    const skinLabel = w.skinType==='closest_to_pin' ? 'Closest to Pin' : 'Low Score';
+    const names = (w.participants||[]).map(pid=>displayName(playerById(pid))).join(', ');
+    const holeText = typeof w.holeIndex==='number' ? `Hole ${w.holeIndex+1}` : 'Unknown hole';
+    return `🕳️ Skins Pool (${skinLabel}) — ${holeText} · ${sessionLabel(w.sessionId)} · ${escapeHtml(names)}`;
+  }
   const kindLabels = { medalist:'Low Net Medalist', birdieKing:'Birdie King', champion:'Tournament Champion', custom:'Custom Prop' };
   if(w.propKind==='custom') return `Custom: ${escapeHtml(w.label||'')} — ${escapeHtml(displayName(playerById(w.creatorId)))} vs ${escapeHtml(displayName(playerById(w.acceptorId)))}`;
   const pickName = (id) => w.propKind==='champion' ? (id==='red'?STATE.teamNames.red:STATE.teamNames.blue) : displayName(playerById(id));
@@ -2292,6 +2459,10 @@ function wagerOutcomeText(w){
   if(w.wagerType===WAGER_TYPE.PRESS){
     const teamName = w.targetTeam==='RED' ? STATE.teamNames.red : STATE.teamNames.blue;
     return `${escapeHtml(teamName)} won the press.`;
+  }
+  if(w.wagerType===WAGER_TYPE.SKINS){
+    const pot = round2(w.amount * (w.participants||[]).length);
+    return `${escapeHtml(displayName(playerById(w.winnerId)))} won the ${fmtMoney(pot)} pot.`;
   }
   return `${escapeHtml(displayName(playerById(w.winnerId)))} won ${fmtMoney(w.amount)}.`;
 }
@@ -2439,6 +2610,7 @@ function renderDisputeWagerCard(w){
   const canForceAccept = w.status===WAGER_STATUS.PENDING;
   const canVoid = w.status===WAGER_STATUS.PENDING || w.status===WAGER_STATUS.ACTIVE;
   const canEditAmount = w.status===WAGER_STATUS.PENDING || w.status===WAGER_STATUS.ACTIVE;
+  const canSettleSkins = w.wagerType===WAGER_TYPE.SKINS && w.status===WAGER_STATUS.ACTIVE;
   return `
   <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
     <div class="flex items-start justify-between gap-2">
@@ -2446,7 +2618,7 @@ function renderDisputeWagerCard(w){
       ${wagerStatusPill(w.status)}
     </div>
     <div class="flex items-center gap-2 mt-1.5 flex-wrap">
-      <span class="text-[11px] text-[#d9b25c] font-display font-600">${fmtMoney(w.amount)} stake</span>
+      <span class="text-[11px] text-[#d9b25c] font-display font-600">${fmtMoney(w.amount)} ${w.wagerType===WAGER_TYPE.SKINS ? 'per player' : 'stake'}</span>
       ${canEditAmount ? `
         <input type="number" min="1" step="1" value="${w.amount}" data-action="dispute-amount-input" data-wager="${w.wagerId}"
           class="w-20 bg-[#0e1712] border border-[#24352a] rounded px-1.5 py-1 text-[11px] text-center focus:outline-none focus:ring-1 focus:ring-[#3fae6a]" />
@@ -2455,6 +2627,14 @@ function renderDisputeWagerCard(w){
     </div>
     ${(w.status===WAGER_STATUS.SETTLED||w.status===WAGER_STATUS.PUSHED) ? `<div class="text-[11px] text-[#7be6a4] mt-1">${wagerOutcomeText(w)}</div>` : ''}
     ${w.status===WAGER_STATUS.VOID ? `<div class="text-[11px] text-[#f2a1ab] mt-1">Voided by admin — no money moved.</div>` : ''}
+    ${canSettleSkins ? `
+    <div class="mt-2">
+      <div class="text-[10px] text-[#7f9689] mb-1">${w.skinType==='closest_to_pin' ? 'Declare the winner (no distance data is tracked, so this always settles manually):' : 'Manual override — normally auto-settles once every participant has a score on this hole:'}</div>
+      <div class="flex flex-wrap gap-2">
+        ${w.participants.map(pid => `<button data-action="dispute-settle-skins" data-wager="${w.wagerId}" data-winner="${pid}" class="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(displayName(playerById(pid)))} won</button>`).join('')}
+        <button data-action="dispute-settle-skins" data-wager="${w.wagerId}" data-winner="push" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Push</button>
+      </div>
+    </div>` : ''}
     ${(canForceAccept || canVoid) ? `
     <div class="flex flex-wrap gap-2 mt-2">
       ${canForceAccept ? `<button data-action="dispute-force-accept" data-wager="${w.wagerId}" class="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg bg-[#123a22] border border-[#2f7d4f] text-[#7be6a4] active:scale-95 transition">✓ Force Accept</button>` : ''}
@@ -2962,16 +3142,17 @@ function renderPinModal(){
   if(!(m && m.open)) return '';
   const player = playerById(m.playerId);
   const titleMap = {
-    propose: 'Confirm Wager', accept: 'Accept Wager', press: 'Call the Press',
+    propose: 'Confirm Wager', accept: 'Accept Wager', press: 'Call the Press', skins: 'Start Skins Pool',
   };
   const subMap = {
     propose: 'Only the proposer can put their own name on the line.',
     accept: 'Enter your PIN to lock in your side of this bet.',
     press: 'Enter your PIN to call the press on behalf of your team.',
+    skins: 'Any participant can authorize starting the pool for the whole group.',
   };
 
   const candidates = (m.context && m.context.candidateIds) || [];
-  const candidateSelector = (m.mode==='press' && candidates.length>1) ? `
+  const candidateSelector = ((m.mode==='press' || m.mode==='skins') && candidates.length>1) ? `
     <select data-action="pin-player-select" class="w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs text-center mb-3 focus:outline-none focus:ring-1 focus:ring-[#3fae6a]">
       ${candidates.map(pid => `<option value="${pid}" ${pid===m.playerId?'selected':''}>${escapeHtml(displayName(playerById(pid)))}</option>`).join('')}
     </select>` : '';
@@ -3329,6 +3510,7 @@ root.addEventListener('click', (e) => {
     const base = cur === '' ? par : cur;
     entry.holes[hole][role] = Math.max(1, Math.min(15, base + delta));
     settleWagersForPairing(matchId, pairing);
+    settleSkinsWagers();
     renderApp();
 
   } else if(act==='score-set-par'){
@@ -3340,6 +3522,7 @@ root.addEventListener('click', (e) => {
     const par = parseInt(action.dataset.par,10) || 4;
     STATE.scores[matchId][pairing].holes[hole][role] = par;
     settleWagersForPairing(matchId, pairing);
+    settleSkinsWagers();
     renderApp();
 
   } else if(act==='toggle-finalize'){
@@ -3349,6 +3532,7 @@ root.addEventListener('click', (e) => {
     const entry = STATE.scores[matchId][pairing];
     entry.finalized = !entry.finalized;
     settleWagersForPairing(matchId, pairing);
+    settleSkinsWagers();
     renderApp();
 
   } else if(act==='initiate-press'){
@@ -3374,6 +3558,19 @@ root.addEventListener('click', (e) => {
     const d = STATE.ui.wagerDraft;
     const amountEl = document.getElementById('wagerAmountInput');
     const amount = Math.max(1, round2(parseFloat(amountEl ? amountEl.value : '10') || 10));
+
+    if(d.kind==='skins'){
+      if(!d.skinsSessionId || d.skinsHoleIndex===''){ alert('Choose a match and a hole.'); return; }
+      if(d.skinsParticipants.length < 2){ alert('A Skins pool needs at least 2 participants.'); return; }
+      STATE.ui.pinModal = {
+        open:true, mode:'skins', playerId:d.skinsParticipants[0],
+        context:{ sessionId:d.skinsSessionId, holeIndex:parseInt(d.skinsHoleIndex,10), skinType:d.skinType, participantIds:d.skinsParticipants.slice(), amountPerPlayer:amount, candidateIds:d.skinsParticipants.slice() },
+      };
+      tempPinBuffer = '';
+      renderApp();
+      return;
+    }
+
     if(!d.proposerId || !d.opponentId){ alert('Choose a proposer and an opponent.'); return; }
     if(d.proposerId === d.opponentId){ alert('Proposer and opponent must be different players.'); return; }
     let label = '';
@@ -3423,6 +3620,27 @@ root.addEventListener('click', (e) => {
       if(ws) ws.wagersWon += 1;
       if(ls) ls.wagersLost += 1;
       w.status=WAGER_STATUS.SETTLED; w.winnerId=winnerId; w.settledAt=Date.now();
+    }
+    renderApp();
+
+  } else if(act==='dispute-settle-skins'){
+    if(!adminAuthenticated) return;
+    const w = STATE.wagers.find(x=>x.wagerId===action.dataset.wager);
+    if(!w || w.wagerType!==WAGER_TYPE.SKINS || w.status!==WAGER_STATUS.ACTIVE) return;
+    const winner = action.dataset.winner;
+    const holeLabel = `Hole ${w.holeIndex+1} — ${sessionLabel(w.sessionId)}`;
+    if(winner==='push'){
+      w.status = WAGER_STATUS.PUSHED; w.winnerId = null; w.settledAt = Date.now();
+    } else if(w.participants.includes(winner)){
+      const potTotal = round2(w.amount * w.participants.length);
+      const netGain = round2(potTotal - w.amount);
+      applyWagerLedger(winner, netGain, TX_TYPE.WAGER_WIN, `Won the Skins pool (admin-settled, ${fmtMoney(potTotal)} pot) — ${holeLabel}`);
+      w.participants.filter(pid => pid!==winner).forEach(pid => {
+        applyWagerLedger(pid, -w.amount, TX_TYPE.WAGER_LOSS, `Lost the Skins pool (admin-settled) — ${holeLabel}`);
+        const ls = playerStats(pid); if(ls) ls.wagersLost += 1;
+      });
+      const ws = playerStats(winner); if(ws) ws.wagersWon += 1;
+      w.status = WAGER_STATUS.SETTLED; w.winnerId = winner; w.settledAt = Date.now();
     }
     renderApp();
 
@@ -3574,6 +3792,15 @@ root.addEventListener('change', (e) => {
     if(field==='matchId'){ STATE.ui.wagerDraft.pairingId=''; STATE.ui.wagerDraft.segment=''; }
     if(field==='pairingId'){ STATE.ui.wagerDraft.segment=''; }
     if(field==='propKind'){ STATE.ui.wagerDraft.proposerPick=''; STATE.ui.wagerDraft.opponentPick=''; }
+    if(field==='skinsSessionId'){ STATE.ui.wagerDraft.skinsHoleIndex=''; }
+    renderApp();
+
+  } else if(e.target.matches('[data-action="skins-participant-toggle"]')){
+    const pid = e.target.dataset.player;
+    const list = STATE.ui.wagerDraft.skinsParticipants;
+    const idx = list.indexOf(pid);
+    if(e.target.checked && idx===-1) list.push(pid);
+    else if(!e.target.checked && idx!==-1) list.splice(idx, 1);
     renderApp();
 
   } else if(e.target.matches('[data-action="pin-player-select"]')){
@@ -3626,7 +3853,7 @@ root.addEventListener('change', (e) => {
         STATE.scores = ensureScoreEntryFields(parsed.scores);
         STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
         STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
-        STATE.wagers = migrateWagerStatuses(parsed.wagers || []);
+        STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
         STATE.transactionLedger = parsed.transactionLedger || [];
         recalcCounters();
         renderApp();
