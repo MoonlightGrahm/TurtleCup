@@ -3102,7 +3102,7 @@ root.addEventListener('click', (e) => {
       settleAllWagers();
 
     } else if(modal.type==='reset-scores'){
-      STATE.scores = buildScoresForLineups(STATE.lineups);
+      STATE.scores = buildScoresForLineups(STATE.lineups, STATE.sessions);
       STATE.wagers = [];
       STATE.transactionLedger = [];
       [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { p.wagerBalance = 0; p.stats = baselinePlayerStats(); });
