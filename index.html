@@ -143,6 +143,31 @@ function changeSessionHoleCount(session, newCount){
   });
 }
 
+// Changing FORMAT can change playersPerSide (e.g. Better Ball's 2-per-side vs Singles' 1-per-side)
+// and/or scoreShape (perPlayer vs teamScore) — either one makes any already-built pairings for this
+// session structurally incompatible (a pairing's `red`/`blue` is a 2-id array for a 2v2 format but a
+// single id string for a 1v1 format) and makes existing scores the wrong shape too. Switching between
+// formats that share the same playersPerSide/scoreShape (e.g. Pinehurst ↔ Scramble, which only differ
+// in handicap allowance %) is always safe and needs no cleanup.
+function changeSessionFormat(session, newFormatKey){
+  if(session.format === newFormatKey || !FORMAT_META[newFormatKey]) return;
+  const oldFmt = formatMeta(session.format);
+  const newFmt = formatMeta(newFormatKey);
+  const shapeChanged = oldFmt.playersPerSide !== newFmt.playersPerSide || oldFmt.scoreShape !== newFmt.scoreShape;
+  if(!shapeChanged){
+    session.format = newFormatKey;
+    return;
+  }
+  const pairs = STATE.lineups[session.sessionId] || [];
+  if(pairs.length > 0){
+    const msg = `Changing ${session.sessionName} from ${oldFmt.label} to ${newFmt.label} changes how players pair up (${oldFmt.playersPerSide} vs ${newFmt.playersPerSide} per side) — this will clear all ${pairs.length} existing pairing${pairs.length===1?'':'s'} and their scores for this match. Continue?`;
+    if(!confirm(msg)) return;
+  }
+  STATE.lineups[session.sessionId] = [];
+  STATE.scores[session.sessionId] = {};
+  session.format = newFormatKey;
+}
+
 function addSession(){
   const id = 'session'+(nextSessionNum++);
   const session = {
@@ -3394,8 +3419,9 @@ root.addEventListener('click', (e) => {
     STATE.roster[side] = STATE.roster[side].filter(p=>p.id!==pid);
     // strip this player from any lineup pairings and their scores
     sessionIds().forEach(mid => {
+      const singlesFmt = formatMeta(sessionById(mid).format).playersPerSide===1;
       STATE.lineups[mid] = (STATE.lineups[mid]||[]).filter(pair => {
-        const involved = mid==='m4' ? [pair.red,pair.blue] : [...pair.red, ...pair.blue];
+        const involved = singlesFmt ? [pair.red,pair.blue] : [...pair.red, ...pair.blue];
         const hit = involved.includes(pid);
         if(hit) delete STATE.scores[mid][pair.id];
         return !hit;
@@ -3821,7 +3847,7 @@ root.addEventListener('change', (e) => {
     else if(field==='date') session.date = e.target.value;
     else if(field==='timeOfDay') session.timeOfDay = e.target.value;
     else if(field==='courseId') session.courseId = e.target.value;
-    else if(field==='format') session.format = FORMAT_META[e.target.value] ? e.target.value : session.format;
+    else if(field==='format') changeSessionFormat(session, e.target.value);
     else if(field==='holesToPlay') changeSessionHoleCount(session, parseInt(e.target.value,10)===9 ? 9 : 18);
     renderApp();
 
