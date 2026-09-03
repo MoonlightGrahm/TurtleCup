@@ -363,6 +363,27 @@ function ensureSessionsField(state){
   return sessions;
 }
 
+// [FR-SCHED-001/002] Guarantees STATE.lineups / STATE.scores / STATE.ui.pairing / STATE.ui.hole /
+// STATE.ui.draft each have an entry for every session currently in STATE.sessions, and that every
+// pairing within a session has a scores entry. Self-heals any gap (a partial/legacy remote payload,
+// a session added by older code, a race during sync) rather than letting a later render throw on an
+// undefined per-session structure — this is the "graceful fallback to default state shape" layer
+// requested for applyRemoteState()/view renderers, called proactively right after STATE loads from
+// any source rather than relying solely on each renderer's own defensive check.
+function ensureSessionSubStructures(){
+  (STATE.sessions||[]).forEach(s => {
+    const sid = s.sessionId;
+    if(!STATE.lineups[sid]) STATE.lineups[sid] = [];
+    if(!STATE.scores[sid]) STATE.scores[sid] = {};
+    if(typeof STATE.ui.pairing[sid] !== 'number') STATE.ui.pairing[sid] = 0;
+    if(typeof STATE.ui.hole[sid] !== 'number') STATE.ui.hole[sid] = 0;
+    if(!STATE.ui.draft[sid]) STATE.ui.draft[sid] = formatMeta(s.format).playersPerSide===2 ? { r1:'',r2:'',b1:'',b2:'' } : { r:'',b:'' };
+    STATE.lineups[sid].forEach(pair => {
+      if(!STATE.scores[sid][pair.id]) STATE.scores[sid][pair.id] = { holes: emptyHoles(s), finalized:false };
+    });
+  });
+}
+
 function defaultUiForSessions(sessions){
   const pairing = {}, hole = {}, draft = {};
   sessions.forEach(s => {
@@ -482,6 +503,7 @@ function loadState(){
     STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
     STATE.transactionLedger = parsed.transactionLedger || [];
     if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
+    ensureSessionSubStructures();
     lastSavedAt = parsed.savedAt || Date.now();
     return true;
   } catch(e){ return false; }
@@ -648,6 +670,7 @@ function applyRemoteState(data){
     STATE.wagers = migrateWagerShape(migrateWagerStatuses(data.wagers || []));
     STATE.transactionLedger = data.transactionLedger || [];
     recalcCounters();
+    ensureSessionSubStructures();
     renderApp();
   } finally {
     applyingRemoteUpdate = false;
@@ -952,11 +975,19 @@ function segmentPointTotals(segments){
 function evaluateMatch(sessionId, pairingId){
   const session = sessionById(sessionId);
   if(!session) return null;
-  const pair = (STATE.lineups[sessionId] || []).find(p => p.id === pairingId);
+  // Defensive self-heal: a session can legitimately exist in STATE.sessions without a matching
+  // lineups/scores entry (a partial/legacy remote payload, a race during sync) — rather than crash
+  // every downstream render that touches this session, instantiate the missing structure on the fly.
+  if(!STATE.lineups[sessionId]) STATE.lineups[sessionId] = [];
+  if(!STATE.scores[sessionId]) STATE.scores[sessionId] = {};
+  const pair = STATE.lineups[sessionId].find(p => p.id === pairingId);
   if(!pair) return null;
   const fmt = formatMeta(session.format);
   const course = getCourseForMatch(sessionId);
   const { start, count } = holeRange(session);
+  if(!STATE.scores[sessionId][pairingId]){
+    STATE.scores[sessionId][pairingId] = { holes: emptyHoles(session), finalized:false };
+  }
   const entry = STATE.scores[sessionId][pairingId];
   const holesDetail = [];
   const results = [];
@@ -3381,11 +3412,26 @@ root.addEventListener('click', (e) => {
     const input = document.getElementById('adminPasscodeInput');
     const val = input ? input.value : '';
     if(val === STATE.admin.passcode){
+      const previousTab = STATE.ui.tab; // remembered in case the admin-tab render itself fails
       adminAuthenticated = true;
       saveAdminSession(true);
       STATE.ui.modal = { open:false, type:null };
       STATE.ui.tab = 'admin';
-      renderApp();
+      try{
+        renderApp();
+      } catch(err){
+        // The passcode was genuinely correct — adminAuthenticated stays true. This only protects
+        // against the ADMIN TAB's render itself throwing (e.g. a corrupted session object), so a
+        // rendering bug doesn't leave the user stuck looking at a dead, unresponsive modal that only
+        // a full page reload could clear.
+        console.error('Turtle Cup: admin tab render failed after unlock — reverting to previous tab.', err);
+        STATE.ui.tab = previousTab;
+        try{
+          renderApp();
+        } catch(err2){
+          console.error('Turtle Cup: recovery render also failed — state may be corrupted.', err2);
+        }
+      }
     } else {
       const err = document.getElementById('adminPasscodeError');
       if(err) err.textContent = 'Incorrect passcode.';
@@ -3882,6 +3928,7 @@ root.addEventListener('change', (e) => {
         STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
         STATE.transactionLedger = parsed.transactionLedger || [];
         recalcCounters();
+        ensureSessionSubStructures();
         renderApp();
         alert('Tournament data imported successfully.');
       } catch(err){
@@ -3900,6 +3947,7 @@ if(!loadState()){
   STATE = defaultState();
 }
 recalcCounters();
+ensureSessionSubStructures();
 adminAuthenticated = loadAdminSession();
 renderApp();
 
