@@ -1060,11 +1060,18 @@ function computeStandings(){
   let red=0, blue=0, totalAvailable=0;
   sessionIds().forEach(sid => {
     const session = sessionById(sid);
+    if(!session) return;
     const ptsPerMatch = session.holesToPlay === 9 ? 1 : 3;
     allPairingIds(sid).forEach(pid => {
       totalAvailable += ptsPerMatch;
-      const evalr = evaluateMatch(sid, pid);
-      if(evalr){ red += evalr.totals.a; blue += evalr.totals.b; }
+      // One corrupted pairing must never take down the header (and therefore every single render,
+      // on every tab, app-wide) — isolate each pairing's evaluation and just skip it on failure.
+      try{
+        const evalr = evaluateMatch(sid, pid);
+        if(evalr){ red += evalr.totals.a; blue += evalr.totals.b; }
+      } catch(err){
+        console.error(`Turtle Cup: skipped standings for ${sid}/${pid} — evaluateMatch failed.`, err);
+      }
     });
   });
   return { red, blue, totalAvailable, target: totalAvailable/2 };
@@ -3247,21 +3254,37 @@ function renderApp(){
   }
 
   const root = document.getElementById('root');
-  let content;
-  if(STATE.ui.tab==='admin') content = renderAdminTab();
-  else if(STATE.ui.tab==='wagers') content = renderWagerCentralTab();
-  else if(STATE.ui.tab==='settlement') content = renderSettlementTab();
-  else content = renderMatchTab(STATE.ui.tab);
+  try{
+    let content;
+    if(STATE.ui.tab==='admin') content = renderAdminTab();
+    else if(STATE.ui.tab==='wagers') content = renderWagerCentralTab();
+    else if(STATE.ui.tab==='settlement') content = renderSettlementTab();
+    else content = renderMatchTab(STATE.ui.tab);
 
-  root.innerHTML = `
-    ${renderHeader()}
-    ${renderNav()}
-    <div class="flex-1 pb-8">${content}</div>
-    ${renderRecapOverlay()}
-    ${renderConfirmModal()}
-    ${renderAdminLoginModal()}
-    ${renderPinModal()}
-  `;
+    root.innerHTML = `
+      ${renderHeader()}
+      ${renderNav()}
+      <div class="flex-1 pb-8">${content}</div>
+      ${renderRecapOverlay()}
+      ${renderConfirmModal()}
+      ${renderAdminLoginModal()}
+      ${renderPinModal()}
+    `;
+  } catch(err){
+    console.error(`Turtle Cup: render failed for tab "${STATE.ui.tab}" — attempting recovery.`, err);
+    if(STATE.ui._recovering){
+      // The recovery attempt itself failed too — stop retrying (avoids an infinite loop) and show a
+      // direct, actionable message via straight DOM assignment rather than leaving stale dead UI.
+      STATE.ui._recovering = false;
+      root.innerHTML = `<div class="p-6 text-sm text-[#f2a1ab] leading-relaxed">Turtle Cup hit a rendering error it couldn't recover from on its own.<br/><br/>Try reloading the page first. If the problem keeps happening, unlock Admin, use <b>Export Tournament Data</b> to back up what you have, then consider <b>Reset Scores Only</b> (keeps your roster/lineups) or <b>Reset Tournament</b> as a last resort.</div>`;
+      return;
+    }
+    STATE.ui.tab = sessionIds()[0] || 'm1'; // fall back to the least derived-data-dependent view
+    STATE.ui._recovering = true;
+    renderApp(); // exactly one bounded retry — the recursive call's own try/catch guards it
+    STATE.ui._recovering = false;
+    return; // that recursive call already ran saveState()
+  }
 
   saveState();
 }
@@ -3412,26 +3435,11 @@ root.addEventListener('click', (e) => {
     const input = document.getElementById('adminPasscodeInput');
     const val = input ? input.value : '';
     if(val === STATE.admin.passcode){
-      const previousTab = STATE.ui.tab; // remembered in case the admin-tab render itself fails
       adminAuthenticated = true;
       saveAdminSession(true);
       STATE.ui.modal = { open:false, type:null };
       STATE.ui.tab = 'admin';
-      try{
-        renderApp();
-      } catch(err){
-        // The passcode was genuinely correct — adminAuthenticated stays true. This only protects
-        // against the ADMIN TAB's render itself throwing (e.g. a corrupted session object), so a
-        // rendering bug doesn't leave the user stuck looking at a dead, unresponsive modal that only
-        // a full page reload could clear.
-        console.error('Turtle Cup: admin tab render failed after unlock — reverting to previous tab.', err);
-        STATE.ui.tab = previousTab;
-        try{
-          renderApp();
-        } catch(err2){
-          console.error('Turtle Cup: recovery render also failed — state may be corrupted.', err2);
-        }
-      }
+      renderApp(); // renderApp() itself now has a built-in recovery/fallback safety net
     } else {
       const err = document.getElementById('adminPasscodeError');
       if(err) err.textContent = 'Incorrect passcode.';
