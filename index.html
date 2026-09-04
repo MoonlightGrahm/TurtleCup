@@ -2578,17 +2578,29 @@ function renderWagerCentralTab(){
 /* =========================================================
    SETTLEMENT — Final Net Balance + Who Owes Whom
    ========================================================= */
+// A web app launched from an iOS/Android home-screen shortcut runs in "standalone" mode with no
+// browser chrome — there's no real second tab for an external link (venmo:// or a target="_blank"
+// web link) to land in, so iOS in particular tends to flash it open and instantly snap back. That's
+// a platform limitation, not something a link href can fix — the reliable workaround is copying the
+// link and pasting it into a real Safari tab, so we surface that path automatically when detected.
+function isStandalonePWA(){
+  return (window.navigator.standalone === true) || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+
 function payoutLinkButtons(fromPlayer, toPlayer, amount){
   const note = `Turtle Cup settlement`;
   const venmoApp = venmoDeepLink(toPlayer.venmo, amount, note);
   const venmoWeb = venmoWebLink(toPlayer.venmo);
   const zelleText = toPlayer.zelle ? `Zelle ${toPlayer.zelle}` : 'No Zelle on file';
+  const standalone = isStandalonePWA();
   return `
   <div class="flex flex-wrap gap-2 mt-2">
     <a href="${venmoApp}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#0074DE] text-white active:scale-95 transition">Open Venmo</a>
     <a href="${venmoWeb}" target="_blank" rel="noopener" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">Venmo profile</a>
+    ${standalone ? `<button data-action="copy-settlement" data-text="${escapeAttr(venmoWeb)}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">📋 Copy Venmo Link</button>` : ''}
     <button data-action="copy-settlement" data-text="${escapeAttr(`${fmtMoney(amount)} to ${toPlayer.zelle||toPlayer.name} via Zelle`)}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(zelleText)} — Copy</button>
-  </div>`;
+  </div>
+  ${standalone ? `<p class="text-[10px] text-[#f2d17f] mt-1.5">📱 You're using Turtle Cup from a home screen shortcut, so Venmo's app/website links may bounce back instantly (an iOS limitation, not a bug). Tap <b>Copy Venmo Link</b>, then paste it into Safari directly — or open Turtle Cup in Safari itself instead of the shortcut for the smoothest experience.</p>` : ''}`;
 }
 
 function renderSettlementTab(){
