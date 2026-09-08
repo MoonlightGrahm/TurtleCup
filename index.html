@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>Turtle Cup — Ryder Cup Format</title>
+<title>Turtle Classic — Ryder Cup Format</title>
 <!-- Makes "Add to Home Screen" launch as a true standalone app (no browser chrome) rather than a
      regular bookmarked tab — this is what makes navigator.standalone / display-mode:standalone
      actually report true, which several in-app checks (e.g. the Venmo-link fallback on Settlement)
      rely on to detect this context and adjust accordingly. -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Turtle Cup">
+<meta name="apple-mobile-web-app-title" content="Turtle Classic">
 <meta name="mobile-web-app-capable" content="yes">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
@@ -50,7 +50,7 @@
 
 <script>
 /* =========================================================
-   TURTLE CUP — RYDER CUP FORMAT — DATA MODEL
+   TURTLE CLASSIC — RYDER CUP FORMAT — DATA MODEL
    ========================================================= */
 const RED = '#fb6a6a';
 const BLUE = '#5aa9f2';
@@ -702,7 +702,7 @@ async function pushCloudState(immediate){
       if(isSpuriousCloneError(e)){
         // The write almost certainly went through — only the browser's postMessage relay choked.
         // Don't scare the user with a red error banner for something that isn't a sync problem.
-        console.warn('Turtle Cup: ignored a spurious DataCloneError while pushing to Supabase (likely a preview-sandbox postMessage relay, not a real failure).', e);
+        console.warn('Turtle Classic: ignored a spurious DataCloneError while pushing to Supabase (likely a preview-sandbox postMessage relay, not a real failure).', e);
         lastCloudPushAt = Date.now();
         outboxPending = false;
         pendingLocalChange = false;
@@ -1078,7 +1078,7 @@ function computeStandings(){
         const evalr = evaluateMatch(sid, pid);
         if(evalr){ red += evalr.totals.a; blue += evalr.totals.b; }
       } catch(err){
-        console.error(`Turtle Cup: skipped standings for ${sid}/${pid} — evaluateMatch failed.`, err);
+        console.error(`Turtle Classic: skipped standings for ${sid}/${pid} — evaluateMatch failed.`, err);
       }
     });
   });
@@ -1490,7 +1490,7 @@ function renderHeader(){
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl">🐢</span>
-          <h1 class="font-display font-700 text-xl tracking-tight">Turtle Cup</h1>
+          <h1 class="font-display font-700 text-xl tracking-tight">Turtle Classic</h1>
         </div>
         <p class="text-[11px] text-[#7f9689] mt-0.5">Multi-Course Ryder Cup Format</p>
         <div class="flex items-center gap-1.5 mt-1.5">
@@ -2020,7 +2020,7 @@ function generateRandomPinsForEmpty(){
 }
 
 function buildPinListText(){
-  const lines = [`🐢 Turtle Cup — Player PINs`, ''];
+  const lines = [`🐢 Turtle Classic — Player PINs`, ''];
   lines.push(`${STATE.teamNames.red}:`);
   STATE.roster.red.forEach(p => lines.push(`  ${displayName(p)} (${p.name}) — ${p.pin || '----'}`));
   lines.push('');
@@ -2596,7 +2596,7 @@ function isStandalonePWA(){
 }
 
 function payoutLinkButtons(fromPlayer, toPlayer, amount){
-  const note = `Turtle Cup settlement`;
+  const note = `Turtle Classic settlement`;
   const venmoApp = venmoDeepLink(toPlayer.venmo, amount, note);
   const venmoWeb = venmoWebLink(toPlayer.venmo);
   const zelleText = toPlayer.zelle ? `Zelle ${toPlayer.zelle}` : 'No Zelle on file';
@@ -2608,7 +2608,7 @@ function payoutLinkButtons(fromPlayer, toPlayer, amount){
     ${standalone ? `<button data-action="copy-settlement" data-text="${escapeAttr(venmoWeb)}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">📋 Copy Venmo Link</button>` : ''}
     <button data-action="copy-settlement" data-text="${escapeAttr(`${fmtMoney(amount)} to ${toPlayer.zelle||toPlayer.name} via Zelle`)}" class="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[#16241b] border border-[#243527] text-[#c9d8cd] active:scale-95 transition">${escapeHtml(zelleText)} — Copy</button>
   </div>
-  ${standalone ? `<p class="text-[10px] text-[#f2d17f] mt-1.5">📱 You're using Turtle Cup from a home screen shortcut, so Venmo's app/website links may bounce back instantly (an iOS limitation, not a bug). Tap <b>Copy Venmo Link</b>, then paste it into Safari directly — or open Turtle Cup in Safari itself instead of the shortcut for the smoothest experience.</p>` : ''}`;
+  ${standalone ? `<p class="text-[10px] text-[#f2d17f] mt-1.5">📱 You're using Turtle Classic from a home screen shortcut, so Venmo's app/website links may bounce back instantly (an iOS limitation, not a bug). Tap <b>Copy Venmo Link</b>, then paste it into Safari directly — or open Turtle Classic in Safari itself instead of the shortcut for the smoothest experience.</p>` : ''}`;
 }
 
 function renderSettlementTab(){
@@ -3020,7 +3020,7 @@ function renderRecapOverlay(){
         <div class="flex items-center gap-3">
           <span class="text-3xl md:text-4xl">🐢</span>
           <div>
-            <div class="font-display font-700 text-lg md:text-2xl text-[#f5efe0]">Turtle Cup — Post-Match Recap</div>
+            <div class="font-display font-700 text-lg md:text-2xl text-[#f5efe0]">Turtle Classic — Post-Match Recap</div>
             <div class="text-xs md:text-sm text-[#8fa396]">Terrapin Ridge Trail · Ryder Cup Format</div>
           </div>
         </div>
@@ -3070,7 +3070,7 @@ function renderRecapOverlay(){
       <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-3">Session Match Breakdown</h2>
       ${recapMatchBreakdown(sessionIdList) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
 
-      <div class="text-center text-[10px] text-[#5c6f61] mt-8 mb-4">Turtle Cup · Live recap — updates automatically as scores are entered</div>
+      <div class="text-center text-[10px] text-[#5c6f61] mt-8 mb-4">Turtle Classic · Live recap — updates automatically as scores are entered</div>
     </div>
   </div>`;
 }
@@ -3291,12 +3291,12 @@ function renderApp(){
       ${renderPinModal()}
     `;
   } catch(err){
-    console.error(`Turtle Cup: render failed for tab "${STATE.ui.tab}" — attempting recovery.`, err);
+    console.error(`Turtle Classic: render failed for tab "${STATE.ui.tab}" — attempting recovery.`, err);
     if(STATE.ui._recovering){
       // The recovery attempt itself failed too — stop retrying (avoids an infinite loop) and show a
       // direct, actionable message via straight DOM assignment rather than leaving stale dead UI.
       STATE.ui._recovering = false;
-      root.innerHTML = `<div class="p-6 text-sm text-[#f2a1ab] leading-relaxed">Turtle Cup hit a rendering error it couldn't recover from on its own.<br/><br/>Try reloading the page first. If the problem keeps happening, unlock Admin, use <b>Export Tournament Data</b> to back up what you have, then consider <b>Reset Scores Only</b> (keeps your roster/lineups) or <b>Reset Tournament</b> as a last resort.</div>`;
+      root.innerHTML = `<div class="p-6 text-sm text-[#f2a1ab] leading-relaxed">Turtle Classic hit a rendering error it couldn't recover from on its own.<br/><br/>Try reloading the page first. If the problem keeps happening, unlock Admin, use <b>Export Tournament Data</b> to back up what you have, then consider <b>Reset Scores Only</b> (keeps your roster/lineups) or <b>Reset Tournament</b> as a last resort.</div>`;
       return;
     }
     STATE.ui.tab = sessionIds()[0] || 'm1'; // fall back to the least derived-data-dependent view
@@ -3960,7 +3960,7 @@ root.addEventListener('change', (e) => {
         renderApp();
         alert('Tournament data imported successfully.');
       } catch(err){
-        alert('Import failed: that file is not valid Turtle Cup tournament data.');
+        alert('Import failed: that file is not valid Turtle Classic tournament data.');
       }
     };
     reader.readAsText(file);
