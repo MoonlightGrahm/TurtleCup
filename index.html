@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>Turtle Cup — Ryder Cup Format</title>
+<!-- Makes "Add to Home Screen" launch as a true standalone app (no browser chrome) rather than a
+     regular bookmarked tab — this is what makes navigator.standalone / display-mode:standalone
+     actually report true, which several in-app checks (e.g. the Venmo-link fallback on Settlement)
+     rely on to detect this context and adjust accordingly. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Turtle Cup">
+<meta name="mobile-web-app-capable" content="yes">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
