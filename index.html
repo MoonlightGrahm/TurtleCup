@@ -90,11 +90,11 @@ function baselineCourses(){
 // USGA allowance table (which vary by club/local rules anyway), picked to keep the three team
 // formats meaningfully different from each other rather than modeling every real-world convention.
 const FORMAT_META = {
-  betterball: { label:'Better Ball (Four-Ball 2v2)',   playersPerSide:2, scoreShape:'perPlayer', teamAllowancePct:null },
-  pinehurst:  { label:'Pinehurst Alternate Shot (2v2)', playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.50 },
+  betterball: { label:'Better Ball (Four-Ball 2v2)',   playersPerSide:2, scoreShape:'perPlayer', teamAllowancePct:null, individualAllowancePct:0.80, offLowMan:true },
+  pinehurst:  { label:'Pinehurst Alternate Shot (2v2)', playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:null, blend:[0.35,0.15] },
   singles:    { label:'Singles (1v1)',                  playersPerSide:1, scoreShape:'perPlayer', teamAllowancePct:null },
-  altshot:    { label:'Standard Alternate Shot (2v2)',  playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.45 },
-  scramble:   { label:'Scramble (2v2)',                 playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:0.25 },
+  altshot:    { label:'Standard Alternate Shot (2v2)',  playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:null, blend:[0.35,0.15] },
+  scramble:   { label:'Scramble (2v2)',                 playersPerSide:2, scoreShape:'teamScore', teamAllowancePct:null, blend:[0.35,0.15] },
 };
 const FORMAT_ORDER = ['betterball','pinehurst','singles','altshot','scramble'];
 function formatMeta(formatKey){ return FORMAT_META[formatKey] || FORMAT_META.betterball; }
@@ -872,6 +872,10 @@ function teamCourseHandicapOf(session, ids, course){
   const fmt = formatMeta(session.format);
   const ch1 = courseHandicapForSession(session, playerById(ids[0]).hcp, course);
   const ch2 = courseHandicapForSession(session, playerById(ids[1]).hcp, course);
+  if(fmt.blend){
+    // 35% of the lower Course Handicap + 15% of the higher (plus handicaps stay negative in the blend).
+    return Math.round(Math.min(ch1,ch2)*fmt.blend[0] + Math.max(ch1,ch2)*fmt.blend[1]);
+  }
   const pct = fmt.teamAllowancePct == null ? 0.5 : fmt.teamAllowancePct;
   return Math.round((ch1 + ch2) * pct);
 }
@@ -1004,8 +1008,11 @@ function evaluateMatch(sessionId, pairingId){
   if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
     const rp1 = playerById(pair.red[0]), rp2 = playerById(pair.red[1]);
     const bp1 = playerById(pair.blue[0]), bp2 = playerById(pair.blue[1]);
-    const chR1 = courseHandicapForSession(session, rp1.hcp, course), chR2 = courseHandicapForSession(session, rp2.hcp, course);
-    const chB1 = courseHandicapForSession(session, bp1.hcp, course), chB2 = courseHandicapForSession(session, bp2.hcp, course);
+    // Better Ball: 80% of each Course Handicap, then play off the lowest of the four players.
+    const pctBB = fmt.individualAllowancePct==null?1:fmt.individualAllowancePct;
+    const raw80 = [rp1,rp2,bp1,bp2].map(pl=>Math.round(courseHandicapForSession(session, pl.hcp, course)*pctBB));
+    const lowBB = fmt.offLowMan ? Math.min(...raw80) : 0;
+    const [chR1,chR2,chB1,chB2] = raw80.map(v=>v-lowBB);
     for(let i=0;i<count;i++){
       const si = course.sis[start+i];
       const h = entry.holes[i];
@@ -1861,22 +1868,23 @@ function renderHoleCard(matchId, pairingId){
         ${counterRow(displayName(bluePlayers[1]), null, h.raw.b2, h.par, sB2, attrs('b2'), locked, BLUE)}
       </div>
     </div>`;
-    footnote = `Net = Gross − strokes received (Course Handicap vs. this course's hole SI). Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. ${pointsNote}`;
+    footnote = `Handicaps: 80% of Course Handicap, played off the lowest of the four players (low man gets 0). Net = Gross − strokes received by hole SI. Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. ${pointsNote}`;
 
   } else if(format.scoreShape==='teamScore'){
     const sRed = strokesOnHole(courseHcps.red, h.si);
     const sBlue = strokesOnHole(courseHcps.blue, h.si);
     const pct = Math.round((format.teamAllowancePct==null?0.5:format.teamAllowancePct)*100);
+    const fmt35 = format.blend ? `${Math.round(format.blend[0]*100)}% low + ${Math.round(format.blend[1]*100)}% high` : `${pct}% combined`;
     body = `
     <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
-      <span>Team Course Handicap (${pct}% combined) — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
+      <span>Team HCP (${fmt35})  — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
       <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
     </div>
     <div class="mx-4 mt-2 space-y-2">
       ${counterRow(STATE.teamNames.red, `${format.label} team score`, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
       ${counterRow(STATE.teamNames.blue, `${format.label} team score`, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
     </div>`;
-    footnote = `${format.label}: each player's Course Handicap ≈ Index × Slope/113 + Rating − Par (halved for a 9-hole session), then the pair's two handicaps are summed and scaled to ${pct}% for one team number. ${pointsNote}`;
+    footnote = `${format.label}: each player's Course Handicap ≈ Index × Slope/113 + Rating − Par (halved for a 9-hole session), then the team number is ${fmt35} of the pair's Course Handicaps. ${pointsNote}`;
 
   } else { // singles
     const rp = redPlayers[0], bp = bluePlayers[0];
