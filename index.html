@@ -151,6 +151,20 @@ function changeSessionHoleCount(session, newCount){
   });
 }
 
+// Switching Front/Back 9 changes which course holes the entered scores belong to, so confirm and clear.
+function changeSessionNineSide(session, side){
+  side = side==='back' ? 'back' : 'front';
+  if((session.nineSide||'front') === side) return;
+  const pairs = STATE.lineups[session.sessionId] || [];
+  const hasScores = pairs.some(p => {
+    const entry = STATE.scores[session.sessionId] && STATE.scores[session.sessionId][p.id];
+    return entry && entry.holes.some(h => Object.values(h).some(v => v!==''));
+  });
+  if(hasScores && !confirm(`Switching ${session.sessionName} to the ${side} nine will clear every score already entered for this session. Continue?`)) return;
+  session.nineSide = side;
+  pairs.forEach(p => { STATE.scores[session.sessionId][p.id] = { holes: emptyHoles(session), finalized:false }; });
+}
+
 // Changing FORMAT can change playersPerSide (e.g. Better Ball's 2-per-side vs Singles' 1-per-side)
 // and/or scoreShape (perPlayer vs teamScore) — either one makes any already-built pairings for this
 // session structurally incompatible (a pairing's `red`/`blue` is a 2-id array for a 2v2 format but a
@@ -180,7 +194,7 @@ function addSession(){
   const id = 'session'+(nextSessionNum++);
   const session = {
     sessionId:id, sessionName:`Match ${STATE.sessions.length+1}`, date:'', timeOfDay:'AM',
-    courseId: (STATE.courses[0]||{}).id, format:'betterball', holesToPlay:18,
+    courseId: (STATE.courses[0]||{}).id, format:'betterball', holesToPlay:18, nineSide:'front', reRankSI:true,
   };
   STATE.sessions.push(session);
   STATE.lineups[id] = [];
@@ -356,6 +370,8 @@ function ensureSessionsField(state){
   if(Array.isArray(state.sessions) && state.sessions.length){
     state.sessions.forEach(s => {
       if(typeof s.holesToPlay !== 'number') s.holesToPlay = 18;
+      if(s.nineSide!=='back') s.nineSide = 'front';
+      if(typeof s.reRankSI !== 'boolean') s.reRankSI = true;
       if(!FORMAT_META[s.format]) s.format = 'betterball';
       if(typeof s.sessionName !== 'string' || !s.sessionName) s.sessionName = s.sessionId;
       if(typeof s.date !== 'string') s.date = '';
@@ -830,10 +846,11 @@ function disconnectSupabase(){
 /* =========================================================
    CORE GOLF LOGIC
    ========================================================= */
-function strokesOnHole(courseHcp, si){
+function strokesOnHole(courseHcp, si, span){
   if(courseHcp == null || courseHcp < 0) return 0;
-  const base = Math.floor(courseHcp/18);
-  const remainder = courseHcp - base*18; // 0..17
+  const n = span || 18; // 9 when strokes are allocated over a re-ranked 1-9 SI (9-hole sessions)
+  const base = Math.floor(courseHcp/n);
+  const remainder = courseHcp - base*n; // 0..n-1
   return base + (si <= remainder ? 1 : 0);
 }
 
@@ -896,7 +913,21 @@ function holeWinner(a,b){
 
 // 9-hole sessions default to the front nine of the assigned course.
 function holeRange(session){
-  return session.holesToPlay === 9 ? { start:0, count:9 } : { start:0, count:18 };
+  if(session.holesToPlay !== 9) return { start:0, count:18 };
+  return { start: session.nineSide==='back' ? 9 : 0, count:9 };
+}
+
+// 9-hole sessions can re-rank the course's Stroke Indexes 1-9 across just the holes being played
+// (standard 9-hole practice). Ties/duplicates keep hole order. Off => raw 18-hole SI as before.
+function usesReRankedSI(session){ return session.holesToPlay===9 && session.reRankSI!==false; }
+function strokeSpan(session){ return usesReRankedSI(session) ? 9 : 18; }
+function effectiveSI(session, course, holeIdx){
+  const raw = course.sis[holeIdx];
+  if(!usesReRankedSI(session)) return raw;
+  const { start } = holeRange(session);
+  const idxs = Array.from({length:9}, (_,k)=>start+k)
+    .sort((x,y)=> (course.sis[x]-course.sis[y]) || (x-y));
+  return idxs.indexOf(holeIdx) + 1;
 }
 
 // Runs match-play logic over an ordered array of 'a'|'b'|'halved'|null hole results (used per segment)
@@ -1003,6 +1034,7 @@ function evaluateMatch(sessionId, pairingId){
   const entry = STATE.scores[sessionId][pairingId];
   const holesDetail = [];
   const results = [];
+  const SN = strokeSpan(session);
   let redPlayers, bluePlayers, courseHcps;
 
   if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
@@ -1014,12 +1046,12 @@ function evaluateMatch(sessionId, pairingId){
     const lowBB = fmt.offLowMan ? Math.min(...raw80) : 0;
     const [chR1,chR2,chB1,chB2] = raw80.map(v=>v-lowBB);
     for(let i=0;i<count;i++){
-      const si = course.sis[start+i];
+      const si = effectiveSI(session, course, start+i);
       const h = entry.holes[i];
-      const a1 = h.a1===''?null:(h.a1 - strokesOnHole(chR1, si));
-      const a2 = h.a2===''?null:(h.a2 - strokesOnHole(chR2, si));
-      const b1 = h.b1===''?null:(h.b1 - strokesOnHole(chB1, si));
-      const b2 = h.b2===''?null:(h.b2 - strokesOnHole(chB2, si));
+      const a1 = h.a1===''?null:(h.a1 - strokesOnHole(chR1, si, SN));
+      const a2 = h.a2===''?null:(h.a2 - strokesOnHole(chR2, si, SN));
+      const b1 = h.b1===''?null:(h.b1 - strokesOnHole(chB1, si, SN));
+      const b2 = h.b2===''?null:(h.b2 - strokesOnHole(chB2, si, SN));
       const aNet = bestOf(a1,a2), bNet = bestOf(b1,b2);
       const w = holeWinner(aNet,bNet);
       results.push(w);
@@ -1032,10 +1064,10 @@ function evaluateMatch(sessionId, pairingId){
     const chRed = teamCourseHandicapOf(session, pair.red, course);
     const chBlue = teamCourseHandicapOf(session, pair.blue, course);
     for(let i=0;i<count;i++){
-      const si = course.sis[start+i];
+      const si = effectiveSI(session, course, start+i);
       const h = entry.holes[i];
-      const aNet = h.a===''?null:(h.a - strokesOnHole(chRed, si));
-      const bNet = h.b===''?null:(h.b - strokesOnHole(chBlue, si));
+      const aNet = h.a===''?null:(h.a - strokesOnHole(chRed, si, SN));
+      const bNet = h.b===''?null:(h.b - strokesOnHole(chBlue, si, SN));
       const w = holeWinner(aNet,bNet);
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, chRed, chBlue, aNet, bNet, winner:w });
@@ -1048,10 +1080,10 @@ function evaluateMatch(sessionId, pairingId){
     const rp = playerById(pair.red), bp = playerById(pair.blue);
     const chR = courseHandicapForSession(session, rp.hcp, course), chB = courseHandicapForSession(session, bp.hcp, course);
     for(let i=0;i<count;i++){
-      const si = course.sis[start+i];
+      const si = effectiveSI(session, course, start+i);
       const h = entry.holes[i];
-      const aNet = h.a===''?null:(h.a - strokesOnHole(chR, si));
-      const bNet = h.b===''?null:(h.b - strokesOnHole(chB, si));
+      const aNet = h.a===''?null:(h.a - strokesOnHole(chR, si, SN));
+      const bNet = h.b===''?null:(h.b - strokesOnHole(chB, si, SN));
       const w = holeWinner(aNet,bNet);
       results.push(w);
       holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, rp, bp, aNet, bNet, winner:w });
@@ -1851,10 +1883,10 @@ function renderHoleCard(matchId, pairingId){
   let body, footnote;
 
   if(format.scoreShape==='perPlayer' && format.playersPerSide===2){
-    const sA1 = strokesOnHole(courseHcps.red[0], h.si);
-    const sA2 = strokesOnHole(courseHcps.red[1], h.si);
-    const sB1 = strokesOnHole(courseHcps.blue[0], h.si);
-    const sB2 = strokesOnHole(courseHcps.blue[1], h.si);
+    const sA1 = strokesOnHole(courseHcps.red[0], h.si, strokeSpan(session));
+    const sA2 = strokesOnHole(courseHcps.red[1], h.si, strokeSpan(session));
+    const sB1 = strokesOnHole(courseHcps.blue[0], h.si, strokeSpan(session));
+    const sB2 = strokesOnHole(courseHcps.blue[1], h.si, strokeSpan(session));
     body = `
     <div class="mx-4 mt-3">
       ${sectionLabel(STATE.teamNames.red, RED)}
@@ -1871,8 +1903,8 @@ function renderHoleCard(matchId, pairingId){
     footnote = `Handicaps: 80% of Course Handicap, played off the lowest of the four players (low man gets 0). Net = Gross − strokes received by hole SI. Better Ball net = lower of the pair's two net scores. Gold dots mark players receiving a stroke here. ${pointsNote}`;
 
   } else if(format.scoreShape==='teamScore'){
-    const sRed = strokesOnHole(courseHcps.red, h.si);
-    const sBlue = strokesOnHole(courseHcps.blue, h.si);
+    const sRed = strokesOnHole(courseHcps.red, h.si, strokeSpan(session));
+    const sBlue = strokesOnHole(courseHcps.blue, h.si, strokeSpan(session));
     const pct = Math.round((format.teamAllowancePct==null?0.5:format.teamAllowancePct)*100);
     const fmt35 = format.blend ? `${Math.round(format.blend[0]*100)}% low + ${Math.round(format.blend[1]*100)}% high` : `${pct}% combined`;
     body = `
@@ -1888,8 +1920,8 @@ function renderHoleCard(matchId, pairingId){
 
   } else { // singles
     const rp = redPlayers[0], bp = bluePlayers[0];
-    const sRed = strokesOnHole(courseHcps.red, h.si);
-    const sBlue = strokesOnHole(courseHcps.blue, h.si);
+    const sRed = strokesOnHole(courseHcps.red, h.si, strokeSpan(session));
+    const sBlue = strokesOnHole(courseHcps.blue, h.si, strokeSpan(session));
     body = `
     <div class="mx-4 mt-3 space-y-2">
       ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
@@ -2460,7 +2492,7 @@ function renderWagerProposeForm(){
       ${session ? `
       <select data-action="wager-draft-select" data-field="skinsHoleIndex" class="${selectCls}">
         <option value="">Choose hole…</option>
-        ${holeOptions.map(i=>`<option value="${i}" ${String(d.skinsHoleIndex)===String(i)?'selected':''}>Hole ${i+1}</option>`).join('')}
+        ${holeOptions.map(i=>`<option value="${i}" ${String(d.skinsHoleIndex)===String(i)?'selected':''}>Hole ${holeRange(session).start+i+1}</option>`).join('')}
       </select>` : ''}
       <select data-action="wager-draft-select" data-field="skinType" class="${selectCls}">
         <option value="low_score" ${d.skinType==='low_score'?'selected':''}>Low Score (auto-settles from scorecards)</option>
@@ -2791,6 +2823,23 @@ function renderScheduleManagerSection(){
               class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${s.holesToPlay===18 ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">18 Holes</button>
           </div>
         </label>
+        ${s.holesToPlay===9 ? `
+        <label class="text-[10px] text-[#7f9689] col-span-2">Which Nine
+          <div class="flex gap-2 mt-0.5">
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="nineSide" data-value="front"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${s.nineSide!=='back' ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">Front 9 (1–9)</button>
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="nineSide" data-value="back"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${s.nineSide==='back' ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">Back 9 (10–18)</button>
+          </div>
+        </label>
+        <label class="text-[10px] text-[#7f9689] col-span-2">Stroke Index
+          <div class="flex gap-2 mt-0.5">
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="reRankSI" data-value="1"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${usesReRankedSI(s) ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">Re-rank 1–9</button>
+            <button data-action="session-field" data-session="${s.sessionId}" data-field="reRankSI" data-value="0"
+              class="flex-1 text-xs font-semibold py-1.5 rounded-lg border transition ${!usesReRankedSI(s) ? 'bg-[#3fae6a] text-[#0a100c] border-[#3fae6a]' : 'bg-[#16241b] border-[#243527] text-[#c9d8cd]'}">Use 18-hole SI</button>
+          </div>
+        </label>` : ''}
       </div>
       <p class="text-[10px] text-[#66786b] mt-2">${escapeHtml(sessionSubLabel(s))} · ${pairCount} pairing${pairCount===1?'':'s'} · worth ${s.holesToPlay===9?'1.0 pt':'3.0 pts'} per pairing</p>
     </div>`;
@@ -3535,6 +3584,18 @@ root.addEventListener('click', (e) => {
     const session = sessionById(action.dataset.session);
     if(!session) return;
     changeSessionHoleCount(session, parseInt(action.dataset.value,10)===9 ? 9 : 18);
+    renderApp();
+
+  } else if(act==='session-field' && action.dataset.field==='nineSide'){
+    const session = sessionById(action.dataset.session);
+    if(!session) return;
+    changeSessionNineSide(session, action.dataset.value);
+    renderApp();
+
+  } else if(act==='session-field' && action.dataset.field==='reRankSI'){
+    const session = sessionById(action.dataset.session);
+    if(!session) return;
+    session.reRankSI = action.dataset.value==='1';
     renderApp();
 
   } else if(act==='add-pairing'){
