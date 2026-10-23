@@ -419,7 +419,19 @@ function defaultUiForSessions(sessions){
 }
 
 function defaultPurseConfig(){
-  return { buyInPerPlayer: 100, winningTeamPct: 60, medalistPct: 25, trophyPoolPct: 15, defaultPressAmount: 20 };
+  return { buyInPerPlayer: 100, winningTeamPct: 80, medalistPct: 5, trophyPoolPct: 5, pointsLeaderPct: 10, defaultPressAmount: 20 };
+}
+// Older saves/cloud rows predate the Points Leader pool and carry a 3-way split that would now total
+// more than 100%. If the field is missing, adopt the current default 80/5/5/10 split (buy-in and
+// press stake are kept as saved).
+function normalizePurseConfig(saved){
+  const base = defaultPurseConfig();
+  const cfg = { ...base, ...(saved||{}) };
+  if(!saved || typeof saved.pointsLeaderPct !== 'number'){
+    cfg.winningTeamPct = base.winningTeamPct; cfg.medalistPct = base.medalistPct;
+    cfg.trophyPoolPct = base.trophyPoolPct; cfg.pointsLeaderPct = base.pointsLeaderPct;
+  }
+  return cfg;
 }
 
 function defaultState(){
@@ -523,7 +535,7 @@ function loadState(){
     STATE.lineups = parsed.lineups;
     STATE.scores = ensureScoreEntryFields(parsed.scores);
     STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || DEFAULT_ADMIN_PASSCODE };
-    STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
+    STATE.purseConfig = normalizePurseConfig(parsed.purseConfig);
     STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
     STATE.transactionLedger = parsed.transactionLedger || [];
     if(parsed.ui){ STATE.ui.tab = parsed.ui.tab || 'm1'; STATE.ui.pairing = parsed.ui.pairing || STATE.ui.pairing; STATE.ui.hole = parsed.ui.hole || STATE.ui.hole; }
@@ -690,7 +702,7 @@ function applyRemoteState(data){
     STATE.lineups = data.lineups || STATE.lineups;
     STATE.scores = ensureScoreEntryFields(data.scores || STATE.scores);
     STATE.admin = { passcode: (data.admin && data.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
-    STATE.purseConfig = { ...defaultPurseConfig(), ...(data.purseConfig||{}) };
+    STATE.purseConfig = normalizePurseConfig(data.purseConfig);
     STATE.wagers = migrateWagerShape(migrateWagerStatuses(data.wagers || []));
     STATE.transactionLedger = data.transactionLedger || [];
     recalcCounters();
@@ -1403,7 +1415,40 @@ function settleSkinsWagers(){
   });
 }
 
-// ---- Purse: buy-in pool split across Winning Team / Low Net Medalist / Trophy (Birdie King) ----
+// ---- Individual points: every player is credited with the full points of each pairing they play in
+// (partners share), across all sessions. Includes in-progress matches, like the Team Standings do. ----
+function computePlayerPoints(){
+  const pts = {};
+  [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { pts[p.id] = 0; });
+  sessionIds().forEach(sid => {
+    allPairingIds(sid).forEach(pid => {
+      try{
+        const evalr = evaluateMatch(sid, pid);
+        if(!evalr) return;
+        const reds = [].concat(evalr.pair.red), blues = [].concat(evalr.pair.blue);
+        reds.forEach(id => { if(id in pts) pts[id] += evalr.totals.a; });
+        blues.forEach(id => { if(id in pts) pts[id] += evalr.totals.b; });
+      }catch(err){ console.error('Turtle Classic: skipped points for '+sid+'/'+pid, err); }
+    });
+  });
+  return pts;
+}
+// Top scorer(s) on one side; everyone tied at the top (with > 0 points) is a leader.
+function pointsLeadersFor(side, pts){
+  const team = STATE.roster[side];
+  let top = 0;
+  team.forEach(p => { if((pts[p.id]||0) > top) top = pts[p.id]; });
+  if(top <= 0) return { top:0, ids:[] };
+  return { top, ids: team.filter(p => Math.abs((pts[p.id]||0) - top) < 1e-9).map(p => p.id) };
+}
+// Splits an amount into cents-exact shares (remainder cents go to the first recipients).
+function splitExact(amount, n){
+  if(!n) return [];
+  const cents = Math.round(amount*100), base = Math.floor(cents/n), extra = cents - base*n;
+  return Array.from({length:n}, (_,i) => (base + (i<extra?1:0))/100);
+}
+
+// ---- Purse: buy-in pool split across Winning Team / Low Net Medalist / Trophy (Birdie King) / Points Leaders ----
 function computePursePayouts(){
   const allPlayers = [...STATE.roster.red, ...STATE.roster.blue];
   const totalPlayers = allPlayers.length;
@@ -1412,6 +1457,7 @@ function computePursePayouts(){
   const winningPool = round2(totalPurse * cfg.winningTeamPct / 100);
   const medalistPool = round2(totalPurse * cfg.medalistPct / 100);
   const trophyPool = round2(totalPurse * cfg.trophyPoolPct / 100);
+  const pointsPool = round2(totalPurse * (cfg.pointsLeaderPct||0) / 100);
 
   const payouts = {}; const notes = {};
   allPlayers.forEach(p => { payouts[p.id] = 0; notes[p.id] = []; });
@@ -1447,8 +1493,35 @@ function computePursePayouts(){
     allPlayers.forEach(p => { payouts[p.id] += share; notes[p.id].push(`No individual birdie king yet — split evenly: ${fmtMoney(share)}`); });
   }
 
+  // ---- Points Leaders: one pool, halved between the Red and Blue team's top point earner(s). Ties split
+  // that team's half; a team with no points yet splits its half evenly among its own players. ----
+  const pts = computePlayerPoints();
+  const pointsLeaders = {};
+  const halves = splitExact(pointsPool, 2);
+  ['red','blue'].forEach((side, i) => {
+    const half = halves[i] || 0;
+    const team = STATE.roster[side];
+    const lead = pointsLeadersFor(side, pts);
+    pointsLeaders[side] = lead;
+    const sideName = side==='red' ? STATE.teamNames.red : STATE.teamNames.blue;
+    const recipients = lead.ids.length ? lead.ids : team.map(p=>p.id);
+    if(!recipients.length){
+      // Empty side: spread this half across everyone so the pool always pays out in full.
+      const everyone = allPlayers.map(p=>p.id);
+      splitExact(half, everyone.length).forEach((sh,k) => { payouts[everyone[k]] += sh; });
+      return;
+    }
+    const shares = splitExact(half, recipients.length);
+    recipients.forEach((id,k) => {
+      payouts[id] += shares[k];
+      notes[id].push(lead.ids.length
+        ? `Points Leader (${sideName}, ${lead.top} pts${lead.ids.length>1?', tied':''}): ${fmtMoney(shares[k])}`
+        : `No points yet — ${sideName} points pool split evenly: ${fmtMoney(shares[k])}`);
+    });
+  });
+
   return {
-    totalPurse, winningPool, medalistPool, trophyPool, payouts, notes, winningSide,
+    totalPurse, winningPool, medalistPool, trophyPool, pointsPool, pointsLeaders, payouts, notes, winningSide,
     medalistId: metrics.medalist ? metrics.medalist.id : null,
     birdieKingId: metrics.birdieKing ? metrics.birdieKing.id : null,
   };
@@ -2312,13 +2385,13 @@ function renderPurseSection(){
   const cfg = STATE.purseConfig;
   const totalPlayers = STATE.roster.red.length + STATE.roster.blue.length;
   const totalPurse = round2(cfg.buyInPerPlayer * totalPlayers);
-  const pctSum = cfg.winningTeamPct + cfg.medalistPct + cfg.trophyPoolPct;
+  const pctSum = cfg.winningTeamPct + cfg.medalistPct + cfg.trophyPoolPct + (cfg.pointsLeaderPct||0);
   const fieldCls = "w-full bg-[#0e1712] border border-[#24352a] rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-[#3fae6a]";
 
   return `
   <div class="px-4 pt-5 pb-1">
     <h2 class="font-display font-700 text-lg">💵 Tournament Purse &amp; Buy-In</h2>
-    <p class="text-xs text-[#7f9689]">Every player's buy-in funds the purse, which pays out across three pools based on final results. This combines with side-wager wins/losses at Settlement.</p>
+    <p class="text-xs text-[#7f9689]">Every player's buy-in funds the purse, which pays out across four pools based on final results. This combines with side-wager wins/losses at Settlement.</p>
   </div>
   <div class="mx-4 mb-2 rounded-xl border border-[#1f2f26] bg-[#0f1913] p-3">
     <div class="grid grid-cols-2 gap-2.5">
@@ -2331,7 +2404,7 @@ function renderPurseSection(){
     </div>
     <div class="h-px bg-[#1f2f26] my-3"></div>
     <div class="text-[10px] uppercase tracking-wide text-[#9db3a4] font-semibold mb-2">Purse Allocation ${pctSum!==100 ? `<span class="text-[#f2a1ab] normal-case font-normal">— totals ${pctSum}%, not 100%</span>` : `<span class="text-[#7be6a4] normal-case font-normal">— totals 100% ✅</span>`}</div>
-    <div class="grid grid-cols-3 gap-2">
+    <div class="grid grid-cols-2 gap-2">
       <label class="text-[10px] text-[#7f9689]">Winning Team %
         <input type="number" min="0" max="100" value="${cfg.winningTeamPct}" data-action="purse-field" data-field="winningTeamPct" class="${fieldCls} mt-1" />
       </label>
@@ -2341,8 +2414,11 @@ function renderPurseSection(){
       <label class="text-[10px] text-[#7f9689]">Trophy Pool %
         <input type="number" min="0" max="100" value="${cfg.trophyPoolPct}" data-action="purse-field" data-field="trophyPoolPct" class="${fieldCls} mt-1" />
       </label>
+      <label class="text-[10px] text-[#7f9689]">Points Leaders %
+        <input type="number" min="0" max="100" value="${cfg.pointsLeaderPct||0}" data-action="purse-field" data-field="pointsLeaderPct" class="${fieldCls} mt-1" />
+      </label>
     </div>
-    <p class="text-[10px] text-[#66786b] mt-2">Winning Team pool splits evenly among the players on the side ahead in the Team Standings. Medalist pool goes to the tournament-wide Low Net Medalist. Trophy Pool goes to the tournament-wide Birdie King. Any pool with no clear individual leader yet splits evenly across everyone as a live placeholder.</p>
+    <p class="text-[10px] text-[#66786b] mt-2">Winning Team pool splits evenly among the players on the side ahead in the Team Standings. Medalist pool goes to the tournament-wide Low Net Medalist. Trophy Pool goes to the tournament-wide Birdie King. Points Leaders pool is halved between each side's top point earner (partners share a pairing's points; ties split that side's half). Any pool with no clear individual leader yet splits evenly as a live placeholder.</p>
     <div class="h-px bg-[#1f2f26] my-3"></div>
     <label class="text-[11px] text-[#7f9689] block">Default Press Stake
       <input type="number" min="1" step="5" value="${cfg.defaultPressAmount}" data-action="purse-field" data-field="defaultPressAmount" class="${fieldCls} mt-1 max-w-[140px]" />
@@ -2663,6 +2739,11 @@ function renderSettlementTab(){
   const purseRows = [
     { label:'Winning Team Pool', amt: purse.winningPool, note: purse.winningSide ? `→ ${purse.winningSide==='red'?STATE.teamNames.red:STATE.teamNames.blue}` : '→ tied, split evenly' },
     { label:'Low Net Medalist Pool', amt: purse.medalistPool, note: purse.medalistId ? `→ ${escapeHtml(displayName(playerById(purse.medalistId)))}` : '→ no medalist yet, split evenly' },
+    { label:'Points Leaders Pool', amt: purse.pointsPool, note: ['red','blue'].map(sd => {
+        const l = purse.pointsLeaders[sd];
+        const nm = sd==='red' ? STATE.teamNames.red : STATE.teamNames.blue;
+        return l.ids.length ? `${escapeHtml(nm)}: ${l.ids.map(id=>escapeHtml(displayName(playerById(id)))).join(' & ')} (${l.top} pts)` : `${escapeHtml(nm)}: no points yet, split evenly`;
+      }).join(' · ') },
     { label:'Trophy (Birdie King) Pool', amt: purse.trophyPool, note: purse.birdieKingId ? `→ ${escapeHtml(displayName(playerById(purse.birdieKingId)))}` : '→ no birdie king yet, split evenly' },
   ];
 
@@ -3952,6 +4033,7 @@ root.addEventListener('change', (e) => {
     else if(field==='winningTeamPct') STATE.purseConfig.winningTeamPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
     else if(field==='medalistPct') STATE.purseConfig.medalistPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
     else if(field==='trophyPoolPct') STATE.purseConfig.trophyPoolPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
+    else if(field==='pointsLeaderPct') STATE.purseConfig.pointsLeaderPct = Math.max(0, Math.min(100, Math.round(parseFloat(el.value) || 0)));
     else if(field==='defaultPressAmount') STATE.purseConfig.defaultPressAmount = Math.max(1, round2(parseFloat(el.value) || 20));
     renderApp();
 
@@ -4021,7 +4103,7 @@ root.addEventListener('change', (e) => {
         STATE.lineups = parsed.lineups;
         STATE.scores = ensureScoreEntryFields(parsed.scores);
         STATE.admin = { passcode: (parsed.admin && parsed.admin.passcode) || STATE.admin.passcode || DEFAULT_ADMIN_PASSCODE };
-        STATE.purseConfig = { ...defaultPurseConfig(), ...(parsed.purseConfig||{}) };
+        STATE.purseConfig = normalizePurseConfig(parsed.purseConfig);
         STATE.wagers = migrateWagerShape(migrateWagerStatuses(parsed.wagers || []));
         STATE.transactionLedger = parsed.transactionLedger || [];
         recalcCounters();
