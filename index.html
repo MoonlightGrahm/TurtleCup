@@ -1417,10 +1417,10 @@ function settleSkinsWagers(){
 
 // ---- Individual points: every player is credited with the full points of each pairing they play in
 // (partners share), across all sessions. Includes in-progress matches, like the Team Standings do. ----
-function computePlayerPoints(){
+function computePlayerPoints(sessionIdList){
   const pts = {};
   [...STATE.roster.red, ...STATE.roster.blue].forEach(p => { pts[p.id] = 0; });
-  sessionIds().forEach(sid => {
+  (sessionIdList || sessionIds()).forEach(sid => {
     allPairingIds(sid).forEach(pid => {
       try{
         const evalr = evaluateMatch(sid, pid);
@@ -3150,6 +3150,47 @@ function renderRecapOverlay(){
   const birdieBody = metrics.birdieKing ? escapeHtml(metrics.birdieKing.label) : '—';
   const birdieSub = metrics.birdieKing ? `${metrics.birdieKing.count} birdie${metrics.birdieKing.count>1?'s':''}/eagle${metrics.birdieKing.count>1?'s':''} this session` : 'No birdies or net eagles yet';
 
+  // ---- Points Leaders: top point earner per side (ties shared), plus each side's full ranking ----
+  const pPts = computePlayerPoints(sessionIdList);
+  const fullTournament = session==='all';
+  const pursePL = fullTournament ? computePursePayouts() : null;
+  const halfPool = pursePL ? splitExact(pursePL.pointsPool, 2) : [0,0];
+  const plCard = (side, idx) => {
+    const color = side==='red' ? RED : BLUE;
+    const teamName = side==='red' ? STATE.teamNames.red : STATE.teamNames.blue;
+    const lead = pointsLeadersFor(side, pPts);
+    const ranked = STATE.roster[side].map(p => ({ p, pts: pPts[p.id]||0 })).sort((a,b)=> b.pts-a.pts || displayName(a.p).localeCompare(displayName(b.p)));
+    const names = lead.ids.length ? lead.ids.map(id=>escapeHtml(displayName(playerById(id)))).join(' &amp; ') : '—';
+    const prize = (pursePL && halfPool[idx] > 0 && lead.ids.length)
+      ? `<div class="text-[11px] text-[#d9b25c] mt-1">${fmtMoney(splitExact(halfPool[idx], lead.ids.length)[0])}${lead.ids.length>1?' each':''} from the Points Leaders pool</div>` : '';
+    return `
+    <div class="rounded-xl border border-[#243527] bg-[#101a14] px-4 py-4">
+      <div class="flex items-center justify-between mb-1">
+        <div class="text-[10px] md:text-xs uppercase tracking-wider font-semibold" style="color:${color}">${escapeHtml(teamName)}</div>
+        <div class="text-[10px] text-[#7f9689]">⭐ Points Leader${lead.ids.length>1?'s':''}</div>
+      </div>
+      <div class="font-display font-700 text-xl md:text-2xl text-[#f5efe0]">${names}</div>
+      <div class="text-xs text-[#9db3a4]">${lead.ids.length ? `${lead.top} pts${lead.ids.length>1?' · tied':''}` : 'No points earned yet'}</div>
+      ${prize}
+      <div class="mt-3 space-y-1">
+        ${ranked.map(r => {
+          const isLead = lead.ids.includes(r.p.id);
+          return `<div class="flex items-center justify-between text-xs md:text-sm rounded-lg px-2.5 py-1.5 ${isLead?'bg-[#2a2410] border border-[#6b5a22]':'bg-[#0e1712]'}">
+            <span class="${isLead?'text-[#f2d17f] font-semibold':'text-[#c9d8cd]'}">${isLead?'⭐ ':''}${escapeHtml(displayName(r.p))}</span>
+            <span class="font-display font-600 ${isLead?'text-[#f2d17f]':'text-[#9db3a4]'}">${r.pts}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  };
+  const pointsLeadersSection = `
+      <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-1">⭐ Points Leaders</h2>
+      <p class="text-[11px] text-[#7f9689] mb-3">Partners share each pairing's points. ${fullTournament ? 'Full-tournament totals — these decide the Points Leaders payout.' : 'Totals for this session only — the payout uses Full Tournament.'}</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4 mb-8">
+        ${plCard('red',0)}
+        ${plCard('blue',1)}
+      </div>`;
+
   return `
   <div class="fixed inset-0 z-50 bg-[#05090c] overflow-y-auto shell-pattern">
     <div class="max-w-6xl mx-auto px-5 md:px-10 py-8 md:py-12">
@@ -3204,6 +3245,8 @@ function renderRecapOverlay(){
         ${awardCard('🔨', 'The Hammer', hammerBody, hammerSub)}
         ${awardCard('🐦', 'Birdie King', birdieBody, birdieSub)}
       </div>
+
+      ${pointsLeadersSection}
 
       <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-3">Session Match Breakdown</h2>
       ${recapMatchBreakdown(sessionIdList) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
