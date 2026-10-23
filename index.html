@@ -1073,8 +1073,13 @@ function evaluateMatch(sessionId, pairingId){
     courseHcps = { red:[chR1,chR2], blue:[chB1,chB2] };
 
   } else if(fmt.scoreShape==='teamScore'){
-    const chRed = teamCourseHandicapOf(session, pair.red, course);
-    const chBlue = teamCourseHandicapOf(session, pair.blue, course);
+    // Each side's blended team handicap, then ONLY the difference between the two sides in this pairing
+    // is played: the higher-handicap team receives it, the lower-handicap team plays to 0.
+    const rawTeamRed = teamCourseHandicapOf(session, pair.red, course);
+    const rawTeamBlue = teamCourseHandicapOf(session, pair.blue, course);
+    const diffTeam = Math.abs(rawTeamRed - rawTeamBlue);
+    const chRed = rawTeamRed > rawTeamBlue ? diffTeam : 0;
+    const chBlue = rawTeamBlue > rawTeamRed ? diffTeam : 0;
     for(let i=0;i<count;i++){
       const si = effectiveSI(session, course, start+i);
       const h = entry.holes[i];
@@ -1086,7 +1091,7 @@ function evaluateMatch(sessionId, pairingId){
     }
     redPlayers=[playerById(pair.red[0]), playerById(pair.red[1])];
     bluePlayers=[playerById(pair.blue[0]), playerById(pair.blue[1])];
-    courseHcps = { red:chRed, blue:chBlue };
+    courseHcps = { red:chRed, blue:chBlue, rawRed:rawTeamRed, rawBlue:rawTeamBlue };
 
   } else { // singles: 1 player per side, perPlayer shape
     const rp = playerById(pair.red), bp = playerById(pair.blue);
@@ -1982,14 +1987,14 @@ function renderHoleCard(matchId, pairingId){
     const fmt35 = format.blend ? `${Math.round(format.blend[0]*100)}% low + ${Math.round(format.blend[1]*100)}% high` : `${pct}% combined`;
     body = `
     <div class="mx-4 mt-3 flex gap-3 text-[11px] text-[#9db3a4]">
-      <span>Team HCP (${fmt35})  — <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)}: ${courseHcps.red}</b></span>
-      <span><b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)}: ${courseHcps.blue}</b></span>
+      <span>Team HCP (${fmt35}): <b style="color:${RED}">${escapeHtml(STATE.teamNames.red)} ${courseHcps.rawRed}</b> vs <b style="color:${BLUE}">${escapeHtml(STATE.teamNames.blue)} ${courseHcps.rawBlue}</b> →
+        ${courseHcps.red===courseHcps.blue ? 'no strokes' : `<b style="color:${courseHcps.red>0?RED:BLUE}">${escapeHtml(courseHcps.red>0?STATE.teamNames.red:STATE.teamNames.blue)} gets ${Math.max(courseHcps.red,courseHcps.blue)}</b>`}</span>
     </div>
     <div class="mx-4 mt-2 space-y-2">
       ${counterRow(STATE.teamNames.red, `${format.label} team score`, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
       ${counterRow(STATE.teamNames.blue, `${format.label} team score`, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
     </div>`;
-    footnote = `${format.label}: each player's Course Handicap ≈ Index × Slope/113 + Rating − Par (halved for a 9-hole session), then the team number is ${fmt35} of the pair's Course Handicaps. ${pointsNote}`;
+    footnote = `${format.label}: each player's Course Handicap ≈ Index × Slope/113 + Rating − Par (halved for a 9-hole session), then each team's number is ${fmt35} of the pair's Course Handicaps. Only the difference between the two teams in this pairing is played — the higher team gets those strokes, the lower team plays to 0. ${pointsNote}`;
 
   } else { // singles
     const rp = redPlayers[0], bp = bluePlayers[0];
