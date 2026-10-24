@@ -1453,6 +1453,68 @@ function splitExact(amount, n){
   return Array.from({length:n}, (_,i) => (base + (i<extra?1:0))/100);
 }
 
+// ---- Net Leaderboard (DISPLAY ONLY): every pairing/player plays off its own FULL handicap so net scores are
+// comparable across pairings. Better Ball = each player's 80% allowance with NO low-man adjustment (pairing
+// score = better net of the two); Pinehurst/Alt-Shot/Scramble = the full 35/15 blended team handicap with NO
+// head-to-head differential; Singles = full Course Handicap. Never feeds match results, points or payouts. ----
+function computeNetLeaderboard(sessionIdList){
+  const entries = [];
+  (sessionIdList || sessionIds()).forEach(sid => {
+    allPairingIds(sid).forEach(pid => {
+      try{
+        const evalr = evaluateMatch(sid, pid);
+        if(!evalr) return;
+        const { session, format:fmt, course, holesDetail, redPlayers, bluePlayers } = evalr;
+        const SN = strokeSpan(session);
+        const nz = v => (v===''||v==null||isNaN(Number(v))) ? null : Number(v);
+        const sides = [
+          { side:'red',  players:redPlayers,  ids:[].concat(evalr.pair.red),  keys: ['a1','a2'], k1:'a' },
+          { side:'blue', players:bluePlayers, ids:[].concat(evalr.pair.blue), keys: ['b1','b2'], k1:'b' },
+        ];
+        sides.forEach(sd => {
+          let hcps;
+          if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
+            const pct = fmt.individualAllowancePct==null ? 1 : fmt.individualAllowancePct;
+            hcps = sd.players.map(pl => Math.round(courseHandicapForSession(session, pl.hcp, course) * pct));
+          } else if(fmt.scoreShape==='teamScore'){
+            hcps = [teamCourseHandicapOf(session, sd.ids, course)];
+          } else {
+            hcps = [courseHandicapForSession(session, sd.players[0].hcp, course)];
+          }
+          let gross=0, net=0, par=0, thru=0;
+          holesDetail.forEach(h => {
+            let gBest=null, nBest=null;
+            if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===2){
+              sd.keys.forEach((key,i) => {
+                const g = nz(h.raw[key]); if(g==null) return;
+                const n = g - strokesOnHole(hcps[i], h.si, SN);
+                if(nBest==null || n<nBest) nBest = n;
+                if(gBest==null || g<gBest) gBest = g;
+              });
+            } else {
+              const g = nz(h.raw[sd.k1]);
+              if(g!=null){ gBest = g; nBest = g - strokesOnHole(hcps[0], h.si, SN); }
+            }
+            if(nBest!=null){ gross+=gBest; net+=nBest; par+=h.par; thru++; }
+          });
+          if(!thru) return;
+          entries.push({
+            side: sd.side, sessionId:sid, pairingId:pid, format:fmt.label,
+            label: sd.players.map(pl=>displayName(pl)).join(' / '),
+            hcpLabel: hcps.join(' / '), thru, holes: holesDetail.length, gross, net, par, toPar: net-par,
+          });
+        });
+      }catch(err){ console.error('Turtle Classic: skipped net leaderboard for '+sid+'/'+pid, err); }
+    });
+  });
+  entries.sort((a,b)=> (a.toPar-b.toPar) || (a.net-b.net) || a.label.localeCompare(b.label));
+  entries.forEach((e,i) => {
+    if(i>0 && e.toPar===entries[i-1].toPar){ e.rank = entries[i-1].rank; e.tied = true; entries[i-1].tied = true; }
+    else { e.rank = i+1; e.tied = false; }
+  });
+  return entries;
+}
+
 // ---- Purse: buy-in pool split across Winning Team / Low Net Medalist / Trophy (Birdie King) / Points Leaders ----
 function computePursePayouts(){
   const allPlayers = [...STATE.roster.red, ...STATE.roster.blue];
@@ -3196,6 +3258,31 @@ function renderRecapOverlay(){
         ${plCard('blue',1)}
       </div>`;
 
+  // ---- Net Leaderboard (display only) ----
+  const netEntries = computeNetLeaderboard(sessionIdList);
+  const netSection = `
+      <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-1">📊 Net Leaderboard</h2>
+      <p class="text-[11px] text-[#7f9689] mb-3">Display only — every pairing plays off its full handicap so scores compare fairly (Better Ball 80% each, no low-man; team formats the full 35/15 team handicap; Singles full). Match results, points and payouts are unaffected.</p>
+      ${netEntries.length ? `
+      <div class="rounded-xl border border-[#243527] bg-[#101a14] overflow-hidden mb-8">
+        <div class="grid text-[10px] uppercase tracking-wide text-[#7f9689] px-3 py-2 border-b border-[#1f3024]" style="grid-template-columns:2.2rem minmax(0,1fr) 3rem 3rem 3.4rem 3.4rem">
+          <div>Pos</div><div>Pairing</div><div class="text-right">Thru</div><div class="text-right">Gross</div><div class="text-right">Net</div><div class="text-right">To Par</div>
+        </div>
+        ${netEntries.map(e => {
+          const color = e.side==='red' ? RED : BLUE;
+          const par = e.toPar===0 ? 'E' : (e.toPar>0 ? '+'+e.toPar : String(e.toPar));
+          return `<div class="grid items-center px-3 py-2 text-xs md:text-sm border-b border-[#16241b] ${e.rank===1?'bg-[#2a2410]':''}" style="grid-template-columns:2.2rem minmax(0,1fr) 3rem 3rem 3.4rem 3.4rem">
+            <div class="font-display font-700 ${e.rank===1?'text-[#f2d17f]':'text-[#e6efe8]'}">${e.tied?'T':''}${e.rank}</div>
+            <div class="min-w-0"><div class="truncate font-semibold" style="color:${color}">${escapeHtml(e.label)}</div>
+              <div class="truncate text-[10px] text-[#7f9689]">${escapeHtml(sessionLabel(e.sessionId))} · ${escapeHtml(e.format)} · HCP ${escapeHtml(e.hcpLabel)}</div></div>
+            <div class="text-right text-[#9db3a4]">${e.thru}/${e.holes}</div>
+            <div class="text-right text-[#9db3a4]">${e.gross}</div>
+            <div class="text-right font-semibold">${e.net}</div>
+            <div class="text-right font-display font-700 ${e.toPar<0?'text-[#7be6a4]':(e.toPar>0?'text-[#f2a1ab]':'')}">${par}</div>
+          </div>`;
+        }).join('')}
+      </div>` : `<p class="text-sm text-[#7f9689] mb-8">No scores entered yet.</p>`}`;
+
   return `
   <div class="fixed inset-0 z-50 bg-[#05090c] overflow-y-auto shell-pattern">
     <div class="max-w-6xl mx-auto px-5 md:px-10 py-8 md:py-12">
@@ -3252,6 +3339,8 @@ function renderRecapOverlay(){
       </div>
 
       ${pointsLeadersSection}
+
+      ${netSection}
 
       <h2 class="font-display font-700 text-lg md:text-xl text-[#f5efe0] mb-3">Session Match Breakdown</h2>
       ${recapMatchBreakdown(sessionIdList) || `<p class="text-sm text-[#7f9689]">No pairings scheduled for this session yet.</p>`}
