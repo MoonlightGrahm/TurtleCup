@@ -1095,18 +1095,25 @@ function evaluateMatch(sessionId, pairingId){
 
   } else { // singles: 1 player per side, perPlayer shape
     const rp = playerById(pair.red), bp = playerById(pair.blue);
-    const chR = courseHandicapForSession(session, rp.hcp, course), chB = courseHandicapForSession(session, bp.hcp, course);
+    // Match play: only the DIFFERENCE between the two players' Course Handicaps is played — the higher
+    // handicap gets those strokes, the lower plays to 0. (aNetFull/bNetFull keep each player's full-handicap
+    // net for the individual awards — Low Net Medalist and Birdie King net eagles — which must stay comparable.)
+    const fullR = courseHandicapForSession(session, rp.hcp, course), fullB = courseHandicapForSession(session, bp.hcp, course);
+    const diffS = Math.abs(fullR - fullB);
+    const chR = fullR > fullB ? diffS : 0, chB = fullB > fullR ? diffS : 0;
     for(let i=0;i<count;i++){
       const si = effectiveSI(session, course, start+i);
       const h = entry.holes[i];
       const aNet = h.a===''?null:(h.a - strokesOnHole(chR, si, SN));
       const bNet = h.b===''?null:(h.b - strokesOnHole(chB, si, SN));
+      const aNetFull = h.a===''?null:(h.a - strokesOnHole(fullR, si, SN));
+      const bNetFull = h.b===''?null:(h.b - strokesOnHole(fullB, si, SN));
       const w = holeWinner(aNet,bNet);
       results.push(w);
-      holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, rp, bp, aNet, bNet, winner:w });
+      holesDetail.push({ hole:start+i+1, par:course.pars[start+i], si, raw:h, rp, bp, aNet, bNet, aNetFull, bNetFull, winner:w });
     }
     redPlayers=[rp]; bluePlayers=[bp];
-    courseHcps = { red:chR, blue:chB };
+    courseHcps = { red:chR, blue:chB, rawRed:fullR, rawBlue:fullB };
   }
 
   const segments = computeSegments(session, results);
@@ -2062,12 +2069,16 @@ function renderHoleCard(matchId, pairingId){
     const rp = redPlayers[0], bp = bluePlayers[0];
     const sRed = strokesOnHole(courseHcps.red, h.si, strokeSpan(session));
     const sBlue = strokesOnHole(courseHcps.blue, h.si, strokeSpan(session));
+    const diffNote = courseHcps.red===courseHcps.blue
+      ? 'no strokes'
+      : `<b style="color:${courseHcps.red>0?RED:BLUE}">${escapeHtml(displayName(courseHcps.red>0?rp:bp))} gets ${Math.max(courseHcps.red,courseHcps.blue)}</b>`;
     body = `
-    <div class="mx-4 mt-3 space-y-2">
+    <div class="mx-4 mt-3 text-[11px] text-[#9db3a4]">Course HCP: <b style="color:${RED}">${escapeHtml(displayName(rp))} ${courseHcps.rawRed}</b> vs <b style="color:${BLUE}">${escapeHtml(displayName(bp))} ${courseHcps.rawBlue}</b> → ${diffNote}</div>
+    <div class="mx-4 mt-2 space-y-2">
       ${counterRow(displayName(rp), rp.name, h.raw.a, h.par, sRed, attrs('a'), locked, RED)}
       ${counterRow(displayName(bp), bp.name, h.raw.b, h.par, sBlue, attrs('b'), locked, BLUE)}
     </div>`;
-    footnote = `Course Handicap = Index × (Slope/113) + (Rating − Par), applied hole-by-hole using this course's SI. ${pointsNote}`;
+    footnote = `Course Handicap = Index × (Slope/113) + (Rating − Par). Only the difference between the two players is played — the higher handicap gets those strokes (by hole SI) and the lower plays to 0. ${pointsNote}`;
   }
 
   return `${shared}${body}
@@ -3076,7 +3087,7 @@ function computeSessionMetrics(sessionIdList){
       });
     } else if(fmt.scoreShape==='perPlayer' && fmt.playersPerSide===1){
       holesDetail.forEach(h => {
-        addNet(redPlayers[0], RED, h.aNet); addNet(bluePlayers[0], BLUE, h.bNet);
+        addNet(redPlayers[0], RED, h.aNetFull); addNet(bluePlayers[0], BLUE, h.bNetFull);
       });
     }
     // Team-score formats (Pinehurst/Alt-Shot/Scramble) have no individual net breakdown — intentionally excluded from the medalist race.
@@ -3120,8 +3131,8 @@ function computeSessionMetrics(sessionIdList){
       holesDetail.forEach(h => {
         if(h.raw.a!=='' && h.raw.a===h.par-1) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
         if(h.raw.b!=='' && h.raw.b===h.par-1) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
-        if(h.aNet!=null && h.aNet===h.par-2) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
-        if(h.bNet!=null && h.bNet===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
+        if(h.aNetFull!=null && h.aNetFull===h.par-2) bump('p:'+redPlayers[0].id, displayName(redPlayers[0]), RED);
+        if(h.bNetFull!=null && h.bNetFull===h.par-2) bump('p:'+bluePlayers[0].id, displayName(bluePlayers[0]), BLUE);
       });
     } else if(fmt.scoreShape==='teamScore'){
       holesDetail.forEach(h => {
